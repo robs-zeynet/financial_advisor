@@ -7,11 +7,12 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use protocol::{
-    is_pause_command, is_scan_command, is_scan_done_command, ClientMsg, ListenState, ScanCue, ServerMsg,
-    SpokenCommand, VoiceCaps, SCAN_HOTKEY_KEY, VIEWING_HOTKEY_KEY,
+    encode_pdf, is_pause_command, is_scan_command, is_scan_done_command, ClientMsg, DocumentInfo, ListenState,
+    ScanCue, ServerMsg, SpokenCommand, VoiceCaps, MAX_PDF_BYTES, SCAN_HOTKEY_KEY, VIEWING_HOTKEY_KEY,
 };
 use wasm_bindgen::JsCast;
-use web_sys::{Element, HtmlTextAreaElement, KeyboardEvent};
+use wasm_bindgen_futures::JsFuture;
+use web_sys::{DragEvent, Element, File, HtmlInputElement, HtmlTextAreaElement, KeyboardEvent};
 
 use crate::audio::{Mic, Player};
 use crate::capture::{CaptureEvent, Capturer, Mode};
@@ -37,6 +38,9 @@ pub struct CallView {
     listen: Cell<ListenState>,
     ptt_held: Cell<bool>,
     mic_btn: Element,
+    upload_btn: Element,
+    file_input: HtmlInputElement,
+    doc_chip: Element,
     meter_fill: Element,
     voice_status: Element,
     indicator: Element,
@@ -72,9 +76,15 @@ impl CallView {
         let view_btn = el_text("button", "", "Resume viewing");
         let scan_btn = el_text("button", "", "Scan page");
         let mic_btn = el_text("button", "", "Mic on");
-        for b in [&start_btn, &end_btn, &share_btn, &view_btn, &scan_btn, &mic_btn] {
+        let upload_btn = el_text("button", "", "Upload PDF…");
+        for b in [&start_btn, &end_btn, &share_btn, &view_btn, &scan_btn, &upload_btn, &mic_btn] {
             append(&controls, b);
         }
+        let file_input: HtmlInputElement = el("input", "hidden-capture").unchecked_into();
+        file_input.set_type("file");
+        file_input.set_accept("application/pdf,.pdf");
+        append(&controls, &file_input);
+        let doc_chip = el("div", "doc-chip");
         let voice_row = el("div", "voice-row");
         let meter = el("div", "meter");
         let meter_fill = el("div", "meter-fill");
@@ -82,6 +92,7 @@ impl CallView {
         let voice_status = el("span", "voice-status");
         append(&voice_row, &meter);
         append(&voice_row, &voice_status);
+        append(&voice_row, &doc_chip);
         let hint = el("div", "hint");
         append(
             &hint,
@@ -98,7 +109,8 @@ impl CallView {
             &el_text(
                 "p",
                 "",
-                "Long page? Click Scan page (or Ctrl+Shift+S, or say or type \u{201c}scan this page\u{201d}), \
+                "Long page or a statement? Easiest is to print it to PDF (Ctrl+P or Cmd+P, then Save as \
+                 PDF) and click Upload PDF, or drop the file here. Or click Scan page (or Ctrl+Shift+S, or say or type \u{201c}scan this page\u{201d}), \
                  then follow the advisor's spoken directions in the shared page: it tells you when to \
                  scroll, when to stop, and when to go back. Say \u{201c}done\u{201d} at the bottom. For \
                  smoother scans, keep this app in its own window.",
@@ -152,6 +164,9 @@ impl CallView {
             listen: Cell::new(ListenState::Idle),
             ptt_held: Cell::new(false),
             mic_btn,
+            upload_btn,
+            file_input,
+            doc_chip,
             meter_fill,
             voice_status,
             indicator,
@@ -226,6 +241,25 @@ impl CallView {
 
         let me = self.clone();
         on(&self.mic_btn, "click", move |_: web_sys::Event| me.toggle_mic());
+
+        // PDF upload: the button opens the file picker; dropping a file works too.
+        let input = self.file_input.clone();
+        on(&self.upload_btn, "click", move |_: web_sys::Event| input.click());
+        let me = self.clone();
+        on(&self.file_input, "change", move |_: web_sys::Event| {
+            if let Some(file) = me.file_input.files().and_then(|f| f.get(0)) {
+                me.upload(file);
+            }
+            me.file_input.set_value("");
+        });
+        on(&dom::document(), "dragover", move |e: DragEvent| e.prevent_default());
+        let me = self.clone();
+        on(&dom::document(), "drop", move |e: DragEvent| {
+            e.prevent_default();
+            if let Some(file) = e.data_transfer().and_then(|d| d.files()).and_then(|f| f.get(0)) {
+                me.upload(file);
+            }
+        });
 
         // Push-to-talk: hold Space (outside text fields).
         let me = self.clone();
@@ -482,6 +516,57 @@ impl CallView {
         });
     }
 
+    /// Reads a PDF and sends it to the server (memory only there).
+    fn upload(self: &Rc<Self>, file: File) {
+        if !self.in_call.get() {
+            self.set_status("Start a call before uploading a PDF.", true);
+            return;
+        }
+        let name = file.name();
+        if file.size() as usize > MAX_PDF_BYTES {
+            let mb = MAX_PDF_BYTES / (1024 * 1024);
+            self.set_status(&format!("That PDF is larger than {mb} MB; try printing fewer pages."), true);
+            return;
+        }
+        self.set_status(&format!("Uploading {name}…"), false);
+        let me = self.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let Ok(buf) = JsFuture::from(file.array_buffer()).await else {
+                me.set_status("Couldn't read that file.", true);
+                return;
+            };
+            let bytes = js_sys::Uint8Array::new(&buf).to_vec();
+            if !bytes.starts_with(b"%PDF-") {
+                me.set_status("That file isn't a PDF. Print the page to PDF and upload that.", true);
+                return;
+            }
+            if let Some(ws) = me.ws.borrow().as_ref() {
+                ws.send_bytes(&encode_pdf(&name, &bytes));
+            }
+        });
+    }
+
+    fn show_document(&self, doc: Option<DocumentInfo>) {
+        self.doc_chip.set_inner_html("");
+        let Some(doc) = doc else { return };
+        let pages = match doc.pages {
+            Some(1) => " · 1 page".to_string(),
+            Some(n) => format!(" · {n} pages"),
+            None => String::new(),
+        };
+        let kb = (doc.bytes as f64 / 1024.0).round();
+        append(&self.doc_chip, &el_text("span", "", &format!("📄 {}{pages} · {kb} KB", doc.name)));
+        let remove = el_text("button", "link", "Remove");
+        let ws = self.ws.borrow().clone();
+        on(&remove, "click", move |_: web_sys::Event| {
+            if let Some(ws) = &ws {
+                ws.send(&ClientMsg::RemoveDocument);
+            }
+        });
+        append(&self.doc_chip, &remove);
+        self.set_status("PDF uploaded. Ask about it whenever you like; it's kept only for this call.", false);
+    }
+
     fn toggle_mic(&self) {
         let Some(mic) = self.mic.borrow().clone() else { return };
         let on = !mic.is_on();
@@ -554,10 +639,12 @@ impl CallView {
                 self.in_call.set(true);
                 self.transcript.set_inner_html("");
                 self.clear_notes();
+                self.show_document(None);
                 self.set_status("Call started. Viewing is paused.", false);
             }
             ServerMsg::SessionEnded { .. } => {
                 self.in_call.set(false);
+                self.show_document(None);
                 self.set_status("Call ended.", false);
             }
             ServerMsg::ViewingState { viewing } => {
@@ -592,6 +679,7 @@ impl CallView {
             }
             ServerMsg::ScreenNote { id, page, notes, revision } => self.show_note(id, &page, &notes, revision),
             ServerMsg::Listen { state } => self.listen.set(state),
+            ServerMsg::DocumentState { document } => self.show_document(document),
             ServerMsg::StopAudio { utterance_id } => {
                 if let Some(p) = self.player.borrow().as_ref() {
                     p.stop(utterance_id);
@@ -712,6 +800,7 @@ impl CallView {
         set_disabled(&self.share_btn, !in_call);
         set_disabled(&self.view_btn, !in_call || (!viewing && !sharing));
         set_disabled(&self.scan_btn, !in_call || !sharing);
+        set_disabled(&self.upload_btn, !in_call);
         set_disabled(&self.send_btn, !in_call);
         set_disabled(&self.input, !in_call);
         let mic_on = self.mic.borrow().as_ref().map(|m| m.is_on());

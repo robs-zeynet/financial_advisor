@@ -153,6 +153,8 @@ pub const ACCEPT_SHORT_AFTER_MS: f64 = 3_000.0;
 pub const ACCEPT_GAP_AFTER_MS: f64 = 6_000.0;
 /// No movement this long after a capture: a gentle nudge.
 pub const STILL_THERE_AFTER_MS: f64 = 7_000.0;
+/// On a long page, suggest printing to PDF once this many segments are in.
+pub const SUGGEST_PDF_AT_SEGMENTS: u32 = 6;
 /// The same cue isn't repeated sooner than this...
 const REPEAT_CUE_MS: f64 = 4_000.0;
 /// ...and routine cues are at least this far apart.
@@ -308,7 +310,12 @@ impl ScanProgress {
         match estimate_offset(&last_thumb, thumb) {
             Offset::Rows(r) if r >= MIN_ADVANCE_ROWS => {
                 let segment = self.capture(now, hash, thumb, Some(r), false);
-                let cue = self.cue(now, ScanCue::Captured { segments: self.segments }, true);
+                let cue = if self.segments == SUGGEST_PDF_AT_SEGMENTS {
+                    ScanCue::SuggestPdf
+                } else {
+                    ScanCue::Captured { segments: self.segments }
+                };
+                let cue = self.cue(now, cue, true);
                 Observation { segment: Some(segment), cue }
             }
             Offset::Rows(r) if r > 0 && dwell >= ACCEPT_SHORT_AFTER_MS => {

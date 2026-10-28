@@ -274,3 +274,4 @@ async fn cross_origin_websocket_is_refused() {
     req.headers_mut().insert("origin", format!("http://{addr}").parse().unwrap());
     assert!(tokio_tungstenite::connect_async(req).await.is_ok());
 }
+

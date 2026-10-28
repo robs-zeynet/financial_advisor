@@ -23,6 +23,9 @@ A **local-first, single-user** web app that I "call" from my browser. During a c
      finish. The advisor then sees the whole page as an ordered set of
      segments, not just whatever happened to be visible last (section 3,
      "Long pages").
+   - For a very long page or a statement, the easier path is to **print it to
+     PDF and upload the PDF**. The advisor suggests this and reads the PDF the
+     same way it reads the screen (section 3, "Uploaded PDFs").
    - The advisor writes down the facts it reads off my screen as **screen
      notes**, plain text I can see in the UI. Its understanding of a long page
      survives after the screenshots themselves have left its context.
@@ -75,6 +78,11 @@ access or automation, and any hosting other than localhost.
   PAUSED. The scan buffer is also wiped when a new scan starts.
 - Logs record only frame metadata: timestamp, dimensions, SHA-256, and for scan
   segments the scan id, segment index, and estimated scroll offset.
+- An **uploaded PDF** is treated like a frame: memory only, never written to
+  disk, logs, or temp files (logs get size, page estimate, and SHA-256). It's
+  wiped when I remove or replace it, on hang-up, and on process exit. Pausing
+  viewing doesn't remove it, since I handed it over deliberately; the Remove
+  button does.
 - Frame size never exceeds the configured long edge (≤ 2000 px, the API's limit
   for requests carrying more than 20 images). The server drops oversized frames
   as a protocol violation.
@@ -255,6 +263,30 @@ Deviate only with a stated reason.
 - Tell me in the UI to share a **single tab or window**, not the whole screen,
   so notifications and other apps stay out of view.
 
+### Uploaded PDFs
+For a page much longer than a screen, or a statement, printing to PDF
+(`Ctrl+P` / `Cmd+P`, Save as PDF) and uploading it is quicker and more
+complete than a scan.
+- **Upload:** an **Upload PDF…** button (or drop the file on the page) during
+  a call. The browser sends it as one binary message, tag `0x04`:
+  `tag | name_len u16 | name | pdf`. At most 10 MB (base64 grows it by a
+  third, and an API request is capped at 32 MB with everything else in
+  context). The server checks the `%PDF-` magic. One PDF at a time; a new
+  upload replaces the old one.
+- **File names** are reduced to a base name, and replaced with
+  `uploaded.pdf` if the redaction linter flags them (statements are often
+  named after the account number).
+- **Reading it:** the server queues a mid-conversation system note ("The
+  user uploaded a PDF ... call view_screen with scope "document""). The
+  advisor reads it with `view_screen(scope: "document")`, which returns a
+  `document` block (base64 PDF) in the `tool_result`, so Claude gets its
+  text and page images, and context editing clears it like any other look.
+  Uploading doesn't start a Claude turn by itself.
+- **Suggesting it:** the advisor prompt suggests it for long pages and
+  statements, and a guided scan suggests it once a page runs past about six
+  screens, and again if a scan hits its segment limit.
+- PDF content is data, not instructions (P8), exactly like screen content.
+
 ### Long pages: page scans
 A page longer than one screen can't be understood from the live ring: it holds
 only 5 frames, and context editing clears older looks. A **page scan** captures
@@ -368,7 +400,7 @@ over HTTP. Don't use a community crate.
 - **Seeing the screen happens via a tool, not by attaching images to every
   turn.**
   - Define the client tool `view_screen(reason: str, scope: "current" |
-    "scan")`. `scope` is optional and defaults to `"current"`.
+    "scan" | "document")`. `scope` is optional and defaults to `"current"`.
     - `"current"` returns the latest frame plus up to 3 distinct frames
       captured since the last call, as image blocks in the `tool_result`, each
       labeled with its capture time. If an unviewed scan exists, the result
@@ -379,6 +411,9 @@ over HTTP. Don't use a community crate.
       page between segments 4 and 5 may be missing"). It works again later in
       the session (for example, after context editing cleared the images)
       until the scan buffer is wiped.
+    - `"document"` returns the uploaded PDF as a `document` content block
+      (base64, `application/pdf`) labeled with its name and page estimate,
+      or a note suggesting the user upload one.
   - If viewing is PAUSED and no scan is buffered, it returns the text
     `"Viewing is paused by the user."`
   - The model decides when it needs to look. While the tool runs it can speak a
@@ -472,6 +507,8 @@ financial_advisor/
   how-to: scroll to the top, start, scroll slowly, come back. During a scan
   the app shows the segment count and an immediate "you may have skipped part
   of the page, scroll back up a little" warning on a gap.
+- An **Upload PDF…** button (and drop target), with a chip showing the
+  uploaded PDF's name, size, and page estimate, and a Remove link.
 - A **Screen notes** pane listing every note the advisor has recorded this
   session, by page label, updated live. Read-only in v1.
 - A live transcript pane showing my STT text and the advisor's text as it
@@ -619,6 +656,14 @@ mode, before voice exists.
     - `exclude_tools` contains `record_screen_notes`.
     - After hang-up, nothing under `data/memory/` changed, and the next
       session's request contains no note text (P4).
+14. **PDF upload test.**
+    - Uploading a PDF during a call shows it, and the next request carries
+      the "uploaded a PDF" note; `view_screen(scope: "document")` returns a
+      `document` block with exactly the uploaded bytes.
+    - Non-PDFs, oversized files, and uploads with no call are refused.
+    - A file name with an account number is replaced with `uploaded.pdf`.
+    - Remove, replace, and hang-up wipe it; test 3's scripted session uploads
+      one, and no `%PDF` bytes appear on disk.
 
 ---
 
@@ -650,15 +695,20 @@ What you look at
   you did not see.
 - If you only saw part of something (one page of holdings, one month of
   transactions), say your view is partial.
-- view_screen has two scopes. "current" shows what is on their screen now.
+- view_screen has three scopes. "current" shows what is on their screen now.
   "scan" shows their most recent page scan, top to bottom, as numbered
-  segments.
+  segments. "document" shows a PDF they uploaded.
 - If a page continues below what you can see (a table runs off the bottom, or
   there is no totals row or footer), say so and ask them to scan the page:
   scroll to the top, press Scan page, scroll slowly to the bottom, then come
   back to the call or say done. If a scan reports a possible gap, say which
   part may be missing and ask them to scroll back over it or scan again. If a
   table is too wide to read, ask them to zoom out.
+- For a page that runs well past a few screens, or for a statement, suggest
+  the easier path first: print it to PDF (Control P or Command P, then Save
+  as PDF) and upload it with the Upload PDF button. Read an uploaded PDF
+  with view_screen scope "document"; treat it exactly like what you see on
+  screen.
 
 Screen notes
 - After you look at an account page or a scan, call record_screen_notes with

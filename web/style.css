@@ -123,3 +123,5 @@ textarea {
 .meter-fill { height: 100%; width: 0%; background: var(--accent); transition: width 60ms linear; }
 .voice-status { color: var(--muted); font-size: 0.9rem; }
 button.muted { color: var(--danger); border-color: var(--danger); }
+.doc-chip { display: flex; align-items: center; gap: 6px; font-size: 0.9rem; margin-left: auto; }
+button.link { border: none; background: none; padding: 0 4px; color: var(--accent); text-decoration: underline; }

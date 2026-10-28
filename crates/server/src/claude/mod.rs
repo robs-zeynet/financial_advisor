@@ -56,13 +56,15 @@ pub fn system_blocks(system_prompt: &str, memory: &str) -> Vec<SystemBlock> {
 pub fn view_screen_tool() -> Value {
     json!({
         "name": VIEW_SCREEN,
-        "description": "Look at the user's shared browser window or tab. With scope \"current\" \
-(the default) it returns the most recent screen frame plus up to three earlier distinct frames \
-captured since your last look, each labeled with when it was captured. With scope \"scan\" it \
-returns the user's most recent page scan: every segment of a long page, top to bottom, labeled \
-with its approximate position, with any possible gaps called out. If the user has paused \
-viewing, \"current\" returns a note saying so instead. Use it whenever the answer depends on \
-what is on their screen.",
+        "description": "Look at the user's shared browser window or tab, or a PDF they uploaded. \
+With scope \"current\" (the default) it returns the most recent screen frame plus up to three \
+earlier distinct frames captured since your last look, each labeled with when it was captured. \
+With scope \"scan\" it returns the user's most recent page scan: every segment of a long page, \
+top to bottom, labeled with its approximate position, with any possible gaps called out. With \
+scope \"document\" it returns the PDF the user uploaded (for example a long page they printed \
+to PDF), with its text and page images. If the user has paused viewing, \"current\" returns a \
+note saying so instead. Use it whenever the answer depends on what is on their screen or in \
+their document.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -72,8 +74,8 @@ what is on their screen.",
                 },
                 "scope": {
                     "type": "string",
-                    "enum": ["current", "scan"],
-                    "description": "\"current\" for what is on screen now; \"scan\" for the most recent page scan."
+                    "enum": ["current", "scan", "document"],
+                    "description": "\"current\" for what is on screen now; \"scan\" for the most recent page scan; \"document\" for the uploaded PDF."
                 }
             },
             "required": ["reason"],
@@ -571,3 +573,4 @@ pub fn close_dangling_tool_uses(conv: &mut Conversation) {
         .collect();
     conv.push_user(results);
 }
+

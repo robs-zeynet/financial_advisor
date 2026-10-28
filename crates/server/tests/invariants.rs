@@ -65,20 +65,24 @@ fn tool_list_is_view_screen_and_notes_only() {
 
 // ------------------------------------------------------------ test 3
 
-/// `frames.rs` must not touch the filesystem at all.
+/// `frames.rs` (screen frames) and `document.rs` (uploaded PDFs) must not
+/// touch the filesystem at all.
 #[test]
 fn frame_ring_has_no_disk_io() {
-    let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/frames.rs")).unwrap();
-    let code: String = src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
-    for needle in ["std::fs", "tokio::fs", "File::", "OpenOptions", "tempfile", "temp_dir", "std::io::Write", "BufWriter"] {
-        assert!(!code.contains(needle), "frames.rs must not use {needle}");
+    for file in ["src/frames.rs", "src/document.rs"] {
+        let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file)).unwrap();
+        let code: String = src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        for needle in ["std::fs", "tokio::fs", "File::", "OpenOptions", "tempfile", "temp_dir", "std::io::Write", "BufWriter"] {
+            assert!(!code.contains(needle), "{file} must not use {needle}");
+        }
     }
 }
 
 fn contains_image_magic(bytes: &[u8]) -> bool {
     const JPEG: &[u8] = b"\xFF\xD8\xFF";
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
-    bytes.windows(JPEG.len()).any(|w| w == JPEG) || bytes.windows(PNG.len()).any(|w| w == PNG)
+    const PDF: &[u8] = b"%PDF-";
+    [JPEG, PNG, PDF].iter().any(|m| bytes.windows(m.len()).any(|w| w == *m))
 }
 
 fn files_under(dir: &Path) -> Vec<PathBuf> {
@@ -166,6 +170,9 @@ async fn scripted_session_leaves_no_frames_on_disk() {
     }
     c.send(ClientMsg::EndScan { scan_id: 1 }).await;
     assert!(matches!(c.recv().await, ServerMsg::ScanState { active: false, segments: 4, .. }));
+    // ...and an uploaded PDF, held in memory only.
+    c.send_raw(protocol::encode_pdf("statement.pdf", b"%PDF-1.7\n/Type /Page\nPDF-BODY")).await;
+    assert!(matches!(c.recv().await, ServerMsg::DocumentState { document: Some(_) }));
     c.send(ClientMsg::UserText { text: "look at my holdings".into() }).await;
     let seen = c.recv_until(done).await;
     assert!(seen.iter().any(|m| matches!(m, ServerMsg::ToolActivity { detail, .. } if detail.contains("frames"))));

@@ -21,6 +21,7 @@ use crate::claude::{
     ToolOutput, TurnEvent, PAUSED_TEXT,
 };
 use crate::config::Config;
+use crate::document::{self, UploadedPdf};
 use crate::frames::{FrameRing, ScanBuffer, ScanReject};
 use crate::memory;
 use crate::screen_notes::ScreenNotes;
@@ -74,6 +75,8 @@ pub struct Shared {
     pub scan: ScanBuffer,
     /// This session's screen notes (P9). RAM only.
     pub notes: ScreenNotes,
+    /// The PDF the user uploaded, if any. RAM only.
+    pub document: Option<UploadedPdf>,
     pub violations: u64,
     /// Viewing-state notes for the model, appended after the next user message.
     pub pending_notes: Vec<String>,
@@ -253,6 +256,41 @@ impl Session {
             self.send(m);
         }
         self.send(ServerMsg::ViewingState { viewing: false });
+    }
+
+    /// An uploaded PDF (`TAG_PDF`). Replaces any earlier upload. The advisor
+    /// is told it's there; it reads it with `view_screen` scope "document".
+    pub fn handle_pdf(&mut self, msg: &[u8]) {
+        let (name, bytes) = match protocol::decode_pdf(msg) {
+            Ok(x) => x,
+            Err(_) => return self.send(ServerMsg::Error { message: "That upload was malformed.".into() }),
+        };
+        let pdf = match document::accept(&name, bytes) {
+            Ok(p) => p,
+            Err(e) => return self.send(ServerMsg::Error { message: e.message() }),
+        };
+        tracing::info!(bytes = pdf.bytes.len(), pages = ?pdf.pages, sha256 = %pdf.sha256, "PDF uploaded (memory only)");
+        let info = pdf.info();
+        let note = format!(
+            "The user uploaded a PDF, \"{}\" ({}). Call view_screen with scope \"document\" to read it.",
+            pdf.name,
+            pdf.pages_phrase()
+        );
+        let mut s = self.shared.lock().unwrap();
+        s.document = Some(pdf);
+        s.pending_notes.push(note);
+        drop(s);
+        self.send(ServerMsg::DocumentState { document: Some(info) });
+    }
+
+    /// Discards the uploaded PDF.
+    pub fn remove_document(&mut self) {
+        let mut s = self.shared.lock().unwrap();
+        if s.document.take().is_some() {
+            s.pending_notes.push("The user removed the uploaded PDF; it is no longer available.".into());
+        }
+        drop(s);
+        self.send(ServerMsg::DocumentState { document: None });
     }
 
     /// Speaks page-scan guidance chosen by the browser. Spoken only; it never
@@ -579,6 +617,7 @@ impl Session {
         s.frames.wipe();
         s.scan.wipe();
         s.notes.wipe();
+        s.document = None;
         drop(s);
         self.send(ServerMsg::SessionEnded { session_id: self.id.clone() });
     }
@@ -592,6 +631,7 @@ impl Drop for Session {
             s.frames.wipe();
             s.scan.wipe();
             s.notes.wipe();
+            s.document = None;
         }
     }
 }
@@ -615,7 +655,11 @@ impl ToolHost for SessionHost {
         let reason = input.get("reason").and_then(Value::as_str).unwrap_or("");
         let scope = input.get("scope").and_then(Value::as_str).unwrap_or("current");
         tracing::info!(%reason, %scope, "view_screen");
-        let out = if scope == "scan" { self.look_at_scan() } else { self.look_current() };
+        let out = match scope {
+            "scan" => self.look_at_scan(),
+            "document" => self.look_at_document(),
+            _ => self.look_current(),
+        };
         async move { out }
     }
 
@@ -701,6 +745,26 @@ impl SessionHost {
             content.push(ContentBlock::text(h));
         }
         ToolOutput { content, is_error: false, detail: format!("viewed screen: {n} frames") }
+    }
+
+    fn look_at_document(&self) -> ToolOutput {
+        let mut s = self.shared.lock().unwrap();
+        let Some(pdf) = s.document.as_mut() else {
+            return text_only(
+                "No PDF has been uploaded. For a long page or a statement, suggest the user print it to \
+                 PDF (Ctrl+P or Cmd+P, then Save as PDF) and upload it with the Upload PDF button.",
+                "no PDF uploaded",
+            );
+        };
+        pdf.mark_viewed();
+        let label = format!("PDF \"{}\" uploaded by the user ({}):", pdf.name, pdf.pages_phrase());
+        let detail = format!("read PDF: {} ({})", pdf.name, pdf.pages_phrase());
+        let data = base64::engine::general_purpose::STANDARD.encode(&pdf.bytes);
+        ToolOutput {
+            content: vec![ContentBlock::text(label), ContentBlock::pdf_base64(data, pdf.name.clone())],
+            is_error: false,
+            detail,
+        }
     }
 
     fn look_at_scan(&self) -> ToolOutput {

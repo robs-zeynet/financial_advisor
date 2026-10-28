@@ -335,3 +335,19 @@ fn scan_stops_at_the_segment_cap() {
     assert_eq!(sim.segments.len(), 3);
     assert!(sim.state.scan_full());
 }
+
+#[wasm_bindgen_test]
+fn a_long_scan_suggests_printing_to_pdf_once() {
+    let page = Page::new(5);
+    let mut sim = Sim::new(&page, CaptureSettings::default());
+    sim.start_at_top(1);
+    for stop in [500, 1000, 1500, 2000, 2500, 3000] {
+        sim.scroll_to(stop, 100, 3);
+    }
+    assert_eq!(sim.segments.len(), 7);
+    let suggestions = sim.cues.iter().filter(|c| **c == ScanCue::SuggestPdf).count();
+    assert_eq!(suggestions, 1, "cues: {:?}", sim.cues);
+    let at = sim.cues.iter().position(|c| *c == ScanCue::SuggestPdf).unwrap();
+    assert_eq!(sim.cues[at - 1], ScanCue::Captured { segments: 5 }, "right after the sixth segment");
+    assert!(ScanCue::SuggestPdf.phrase().contains("PDF"));
+}

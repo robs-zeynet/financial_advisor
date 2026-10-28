@@ -28,7 +28,16 @@ Open http://127.0.0.1:8765, click **Start call**, then **Share a window or
 tab…** (pick a single tab or window). Viewing stays ⚪ PAUSED until you click
 **Resume viewing** or press Ctrl+Shift+V.
 
-### Long pages
+### Long pages and statements: upload a PDF
+
+For a page much longer than a screen, or a statement, the easiest path is to
+print it to PDF (Ctrl+P or Cmd+P, then **Save as PDF**) and click **Upload
+PDF…** (or drop the file on the page) during a call. The advisor suggests
+this itself, and reads the PDF's text and pages the same way it reads your
+screen. The PDF is kept in memory only (up to 10 MB), never written to disk,
+and discarded when you click **Remove**, upload another, or hang up.
+
+### Long pages: guided scan
 
 Click **Scan page** (or Ctrl+Shift+S, or say or type "scan this page"), then
 switch to the shared page. The advisor guides you out loud: scroll to the top

@@ -191,6 +191,11 @@ impl FakeClient {
         Self { socket, audio: Vec::new() }
     }
 
+    /// Sends an arbitrary binary message (e.g. a PDF upload).
+    pub async fn send_raw(&mut self, bytes: Vec<u8>) {
+        self.socket.send(WsMessage::Binary(bytes.into())).await.unwrap();
+    }
+
     /// Sends mic audio in 20 ms chunks, as the browser does.
     pub async fn send_mic(&mut self, pcm: &[i16]) {
         for chunk in pcm.chunks(320) {

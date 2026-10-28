@@ -14,6 +14,36 @@ pub const MIC_SAMPLE_RATE: u32 = 16_000;
 pub const TAG_FRAME: u8 = 0x02;
 /// TTS PCM audio (server -> client). See [`TtsHeader`].
 pub const TAG_TTS_PCM: u8 = 0x03;
+/// An uploaded PDF (client -> server): `tag | name_len u16 BE | name UTF-8 | pdf...`.
+pub const TAG_PDF: u8 = 0x04;
+
+/// Largest PDF the app accepts, in bytes. Base64 inflates it by a third, and
+/// the API caps a request at 32 MB including everything else in context.
+pub const MAX_PDF_BYTES: usize = 10 * 1024 * 1024;
+
+/// Encodes a PDF upload message.
+pub fn encode_pdf(name: &str, pdf: &[u8]) -> Vec<u8> {
+    let name: String = name.chars().take(200).collect();
+    let mut out = Vec::with_capacity(3 + name.len() + pdf.len());
+    out.push(TAG_PDF);
+    out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(pdf);
+    out
+}
+
+/// Splits a PDF upload message into its file name and bytes.
+pub fn decode_pdf(msg: &[u8]) -> Result<(String, &[u8]), FrameDecodeError> {
+    if msg.len() < 3 {
+        return Err(FrameDecodeError::TooShort);
+    }
+    if msg[0] != TAG_PDF {
+        return Err(FrameDecodeError::WrongTag(msg[0]));
+    }
+    let n = u16::from_be_bytes([msg[1], msg[2]]) as usize;
+    let name = msg.get(3..3 + n).ok_or(FrameDecodeError::TooShort)?;
+    Ok((String::from_utf8_lossy(name).into_owned(), &msg[3 + n..]))
+}
 
 /// Hotkey that toggles viewing: Ctrl+Shift+V.
 pub const VIEWING_HOTKEY_KEY: &str = "V";
@@ -70,6 +100,8 @@ pub enum ScanCue {
     MaybeBottom,
     /// No movement for a while after a capture.
     StillThere,
+    /// A long scan (past about six screens): suggest a PDF instead, once.
+    SuggestPdf,
     /// The scan hit its segment limit.
     Full,
     /// The user finished the scan.
@@ -98,7 +130,14 @@ impl ScanCue {
             Self::KeepGoing => "Just a little further down, please.",
             Self::MaybeBottom => "Thank you. If that's the bottom of the page, just say done.",
             Self::StillThere => "Whenever you're ready, please scroll down a bit more, or say done if that's the end.",
-            Self::Full => "That's as much as I can take in one scan. Thank you, I'll have a look now.",
+            Self::SuggestPdf => {
+                "Got it, thank you. This is a long page: if it's easier, you can print it to a PDF and \
+                 upload it instead. Otherwise, please keep scrolling."
+            }
+            Self::Full => {
+                "That's as much as I can take in one scan, thank you. For a page this long, printing it to \
+                 a PDF and uploading it works best."
+            }
             Self::Finished => "Thank you, I've got the page.",
         }
     }
@@ -179,6 +218,8 @@ pub enum ClientMsg {
         #[serde(flatten)]
         cue: ScanCue,
     },
+    /// Discard the uploaded PDF. (Uploads arrive as `TAG_PDF` binary messages.)
+    RemoveDocument,
     /// Typed user input. Spoken input arrives as `TAG_MIC_PCM` audio.
     UserText { text: String },
     /// The mic was switched on or off. Off discards any partial utterance.
@@ -187,6 +228,14 @@ pub enum ClientMsg {
     PttDown,
     /// ...and ends now.
     PttUp,
+}
+
+/// What the app shows about an uploaded PDF.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentInfo {
+    pub name: String,
+    pub bytes: u64,
+    pub pages: Option<u32>,
 }
 
 /// What the server can do with voice this session.
@@ -254,6 +303,10 @@ pub enum ServerMsg {
     /// Stop playing this utterance now (barge-in or cancelled turn).
     StopAudio {
         utterance_id: u32,
+    },
+    /// The uploaded PDF, or `None` once removed. `pages` is an estimate.
+    DocumentState {
+        document: Option<DocumentInfo>,
     },
     /// Streaming assistant text.
     AssistantDelta {
@@ -544,6 +597,14 @@ mod tests {
     }
 
     #[test]
+    fn pdf_round_trip() {
+        let msg = encode_pdf("holdings.pdf", b"%PDF-1.7 body");
+        let (name, body) = decode_pdf(&msg).unwrap();
+        assert_eq!((name.as_str(), body), ("holdings.pdf", &b"%PDF-1.7 body"[..]));
+        assert_eq!(decode_pdf(&[TAG_PDF, 0, 9, b'x']), Err(FrameDecodeError::TooShort));
+    }
+
+    #[test]
     fn spoken_commands() {
         use SpokenCommand::*;
         assert_eq!(spoken_command("Okay, scan this page."), Some(StartScan));
@@ -566,6 +627,7 @@ mod tests {
             ScanCue::KeepGoing,
             ScanCue::MaybeBottom,
             ScanCue::StillThere,
+            ScanCue::SuggestPdf,
             ScanCue::Full,
             ScanCue::Finished,
         ];

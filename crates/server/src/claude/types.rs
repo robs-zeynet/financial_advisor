@@ -104,6 +104,12 @@ pub enum ContentBlock {
     Image {
         source: ImageSource,
     },
+    /// A PDF (base64). Claude reads its text and page images.
+    Document {
+        source: ImageSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -137,11 +143,19 @@ impl ContentBlock {
         }
     }
 
+    pub fn pdf_base64(data: String, title: impl Into<String>) -> Self {
+        Self::Document {
+            source: ImageSource { kind: "base64".into(), media_type: "application/pdf".into(), data },
+            title: Some(title.into()),
+        }
+    }
+
     /// The block's `type` string.
     pub fn kind(&self) -> &str {
         match self {
             Self::Text { .. } => "text",
             Self::Image { .. } => "image",
+            Self::Document { .. } => "document",
             Self::ToolUse { .. } => "tool_use",
             Self::ToolResult { .. } => "tool_result",
             Self::Thinking { .. } => "thinking",

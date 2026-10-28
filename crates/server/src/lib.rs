@@ -1,5 +1,6 @@
 pub mod claude;
 pub mod config;
+pub mod document;
 pub mod frames;
 pub mod memory;
 pub mod redact;

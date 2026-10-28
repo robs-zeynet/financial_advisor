@@ -26,6 +26,7 @@ web-sys = { version = "0.3", features = [
   "AudioContext", "BaseAudioContext", "AudioContextOptions", "AudioWorklet", "Worklet", "AudioWorkletNode",
   "AudioWorkletNodeOptions", "AudioNode", "AudioBuffer", "AudioBufferSourceNode", "AudioScheduledSourceNode",
   "AudioDestinationNode", "MediaStreamAudioSourceNode", "MediaStreamConstraints", "MessagePort",
+  "File", "FileList", "DragEvent", "DataTransfer",
 ] }
 
 [dev-dependencies]

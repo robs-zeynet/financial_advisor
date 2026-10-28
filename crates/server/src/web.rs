@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
-use protocol::{ClientMsg, ServerMsg, TAG_FRAME, TAG_MIC_PCM};
+use protocol::{ClientMsg, ServerMsg, TAG_FRAME, TAG_MIC_PCM, TAG_PDF};
 use rust_embed::RustEmbed;
 use tokio::sync::mpsc;
 
@@ -161,6 +161,11 @@ async fn connection(app: Arc<AppState>, socket: WebSocket) {
                         Some(s) => s.user_text(text),
                         None => send(ServerMsg::Error { message: "start a call first".into() }),
                     },
+                    ClientMsg::RemoveDocument => {
+                        if let Some(s) = session.as_mut() {
+                            s.remove_document();
+                        }
+                    }
                     ClientMsg::ScanCue { cue } => {
                         if let Some(s) = session.as_mut() {
                             s.say_cue(cue);
@@ -194,6 +199,8 @@ async fn connection(app: Arc<AppState>, socket: WebSocket) {
                     });
                 }
                 (Some(TAG_MIC_PCM), Some(s)) => s.handle_mic(&data),
+                (Some(TAG_PDF), Some(s)) => s.handle_pdf(&data),
+                (Some(TAG_PDF), None) => send(ServerMsg::Error { message: "Start a call before uploading a PDF.".into() }),
                 (Some(TAG_MIC_PCM), None) => {} // no call: mic audio is ignored
                 (tag, _) => tracing::warn!(?tag, "unknown binary message dropped"),
             },

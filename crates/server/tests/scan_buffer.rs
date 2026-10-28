@@ -176,7 +176,7 @@ async fn view_screen_scan_returns_labeled_segments_after_the_scan_ends() {
     assert_eq!(first["cache_control"], json!({"type": "ephemeral"}));
     assert!(first["context_management"]["edits"][0]["clear_at_least"]["value"].as_u64().unwrap() > 0);
     let scope = &first["tools"][0]["input_schema"]["properties"]["scope"];
-    assert_eq!(scope["enum"], json!(["current", "scan"]));
+    assert_eq!(scope["enum"], json!(["current", "scan", "document"]));
 }
 
 #[tokio::test]
