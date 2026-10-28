@@ -3,3 +3,4 @@
 /target/
 /dist/
 config.toml
+.claude_api_key
