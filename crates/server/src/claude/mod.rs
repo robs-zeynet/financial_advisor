@@ -163,11 +163,33 @@ impl Conversation {
         self.pending_notes.push(text.into());
     }
 
+    /// Appends a user message (text or tool results), followed by any queued
+    /// operator notes as one `role: "system"` message.
+    ///
+    /// The API accepts a mid-conversation system message only right before an
+    /// assistant message or at the end. When a turn ends with no assistant
+    /// reply (an error, or an interruption before anything was heard), its
+    /// note is left at the end; it moves to after this new user message
+    /// instead. That's safe for preserved thinking: nothing after the last
+    /// assistant message carries a thinking block bound to it.
     pub fn push_user(&mut self, content: Vec<ContentBlock>) {
+        let mut dangling = Vec::new();
+        while self.messages.last().is_some_and(|m| m.role == Role::System) {
+            dangling.extend(self.messages.pop());
+        }
+        dangling.reverse();
+        let mut carried: Vec<String> = dangling
+            .into_iter()
+            .flat_map(|m| m.content)
+            .filter_map(|b| match b {
+                ContentBlock::Text { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        carried.append(&mut self.pending_notes);
         self.messages.push(Message { role: Role::User, content });
-        if !self.pending_notes.is_empty() {
-            let text = std::mem::take(&mut self.pending_notes).join("\n");
-            self.messages.push(Message::system_text(text));
+        if !carried.is_empty() {
+            self.messages.push(Message::system_text(carried.join("\n")));
         }
     }
 
@@ -191,6 +213,21 @@ impl Conversation {
             _ => Vec::new(),
         }
     }
+}
+
+/// Checks the ordering rules the API enforces on `messages`: it must not
+/// start with a system message, and a system message must be followed by an
+/// assistant message or end the array.
+pub fn check_message_order(messages: &[Message]) -> Result<(), String> {
+    if messages.first().is_some_and(|m| m.role == Role::System) {
+        return Err("messages.0: role 'system' cannot be first".into());
+    }
+    for (i, pair) in messages.windows(2).enumerate() {
+        if pair[0].role == Role::System && pair[1].role != Role::Assistant {
+            return Err(format!("messages.{i}: role 'system' must precede an 'assistant' message or end the array"));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -574,3 +611,40 @@ pub fn close_dangling_tool_uses(conv: &mut Conversation) {
     conv.push_user(results);
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roles(c: &Conversation) -> Vec<Role> {
+        c.messages.iter().map(|m| m.role).collect()
+    }
+
+    #[test]
+    fn a_note_left_by_a_turn_with_no_reply_moves_after_the_next_user_message() {
+        let mut c = Conversation::new(vec![], vec![]);
+        c.note("viewing resumed");
+        c.push_user(vec![ContentBlock::text("first")]);
+        // The turn failed or was interrupted: no assistant message.
+        c.note("PDF uploaded");
+        c.push_user(vec![ContentBlock::text("second")]);
+        assert_eq!(roles(&c), vec![Role::User, Role::User, Role::System]);
+        assert_eq!(c.messages[2], Message::system_text("viewing resumed\nPDF uploaded"));
+        check_message_order(&c.messages).unwrap();
+
+        // With a reply in between, notes stay where they were.
+        c.push_assistant(vec![ContentBlock::text("ok")]);
+        c.note("scan finished");
+        c.push_user(vec![ContentBlock::text("third")]);
+        assert_eq!(roles(&c), vec![Role::User, Role::User, Role::System, Role::Assistant, Role::User, Role::System]);
+        check_message_order(&c.messages).unwrap();
+    }
+
+    #[test]
+    fn order_check_matches_the_api_rule() {
+        let user = Message::user_text("q");
+        let sys = Message::system_text("n");
+        assert!(check_message_order(&[user.clone(), sys.clone(), user.clone()]).is_err());
+        assert!(check_message_order(&[sys.clone(), user.clone()]).is_err());
+        assert!(check_message_order(&[user.clone(), sys]).is_ok());
+    }
+}

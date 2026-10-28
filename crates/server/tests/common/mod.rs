@@ -64,7 +64,15 @@ pub async fn spawn_mock_claude(replies: Vec<MockReply>) -> MockClaude {
             let reqs = reqs.clone();
             async move {
                 let body: Value = serde_json::from_slice(&body).unwrap();
+                // Enforce the API's ordering rule on every request, as the real API does.
+                let order: Vec<server::claude::types::Message> =
+                    serde_json::from_value(body["messages"].clone()).expect("messages parse");
+                let order_err = server::claude::check_message_order(&order).err();
                 reqs.lock().unwrap().push(Captured { headers, body });
+                if let Some(e) = order_err {
+                    let err = serde_json::json!({"type": "error", "error": {"type": "invalid_request_error", "message": e}});
+                    return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
+                }
                 let reply = replies.lock().unwrap().pop_front().expect("unexpected extra request");
                 let resp: Response = match reply {
                     MockReply::Sse(name) => {

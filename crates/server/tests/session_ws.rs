@@ -275,3 +275,56 @@ async fn cross_origin_websocket_is_refused() {
     assert!(tokio_tungstenite::connect_async(req).await.is_ok());
 }
 
+/// Regression: a turn that ends with no assistant reply used to leave its
+/// system note dangling, so the next request had `system` followed by `user`
+/// and the API rejected it ("role 'system' must precede an 'assistant'
+/// message or end the array"). The mock now enforces that rule.
+#[tokio::test]
+async fn turns_without_a_reply_dont_break_the_next_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock = spawn_mock_claude(vec![
+        // 1: fails outright.
+        MockReply::Status {
+            status: 400,
+            retry_after: None,
+            body: r#"{"type":"error","error":{"type":"invalid_request_error","message":"boom"}}"#,
+        },
+        // 2: streams slowly and is interrupted before any text.
+        MockReply::SlowSse("text.sse", 400),
+        // 3 and 4: succeed.
+        MockReply::Sse("text.sse"),
+        MockReply::Sse("text.sse"),
+    ])
+    .await;
+    let (addr, _) = spawn_app(test_config(dir.path(), &mock.base_url)).await;
+    let mut c = FakeClient::connect(addr).await;
+    c.start_call().await;
+
+    // A note (viewing resumed), then a turn that errors.
+    c.set_viewing(true).await;
+    c.send(ClientMsg::UserText { text: "first".into() }).await;
+    let seen = c.recv_until(done).await;
+    assert!(seen.iter().any(|m| matches!(m, ServerMsg::Error { message } if message.contains("boom"))));
+
+    // Another note (a PDF upload), then a turn interrupted before any reply.
+    c.send_raw(protocol::encode_pdf("statement.pdf", b"%PDF-1.7\n/Type /Page\n")).await;
+    c.recv().await;
+    c.send(ClientMsg::UserText { text: "second".into() }).await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    c.send(ClientMsg::UserText { text: "third".into() }).await;
+    let seen = c.recv_until(|m| matches!(m, ServerMsg::AssistantDone { stop_reason } if stop_reason != "cancelled")).await;
+    assert!(!seen.iter().any(|m| matches!(m, ServerMsg::Error { .. })), "{seen:?}");
+
+    // And the conversation keeps going.
+    c.send(ClientMsg::UserText { text: "fourth".into() }).await;
+    let seen = c.recv_until(done).await;
+    assert_eq!(seen.last(), Some(&ServerMsg::AssistantDone { stop_reason: "end_turn".into() }));
+
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 4);
+    // Every note survived, after the latest user message of its turn.
+    let last = reqs[3].body["messages"].as_array().unwrap();
+    let notes: Vec<&str> = last.iter().filter(|m| m["role"] == "system").filter_map(|m| m["content"][0]["text"].as_str()).collect();
+    let all = notes.join("\n");
+    assert!(all.contains("resumed screen viewing") && all.contains("uploaded a PDF"), "{notes:?}");
+}
