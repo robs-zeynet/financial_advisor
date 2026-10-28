@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use protocol::{
-    is_pause_command, is_scan_command, is_scan_done_command, ClientMsg, ListenState, ServerMsg, SpokenCommand,
-    VoiceCaps, SCAN_HOTKEY_KEY, VIEWING_HOTKEY_KEY,
+    is_pause_command, is_scan_command, is_scan_done_command, ClientMsg, ListenState, ScanCue, ServerMsg,
+    SpokenCommand, VoiceCaps, SCAN_HOTKEY_KEY, VIEWING_HOTKEY_KEY,
 };
 use wasm_bindgen::JsCast;
 use web_sys::{Element, HtmlTextAreaElement, KeyboardEvent};
@@ -98,9 +98,10 @@ impl CallView {
             &el_text(
                 "p",
                 "",
-                "Long page? Scroll it to the top, click Scan page (or Ctrl+Shift+S, or say or type \u{201c}scan \
-                 this page\u{201d}), scroll slowly to the bottom in the shared tab, then come back here or \
-                 say \u{201c}done.\u{201d} For smoother scans, keep this app in its own window.",
+                "Long page? Click Scan page (or Ctrl+Shift+S, or say or type \u{201c}scan this page\u{201d}), \
+                 then follow the advisor's spoken directions in the shared page: it tells you when to \
+                 scroll, when to stop, and when to go back. Say \u{201c}done\u{201d} at the bottom. For \
+                 smoother scans, keep this app in its own window.",
             ),
         );
         append(
@@ -388,15 +389,30 @@ impl CallView {
         c.start_scan(scan_id); // capture starts locally at once...
         self.ws_send(&ClientMsg::StartScan { scan_id }); // ...and the server is told
         self.set_status(
-            "Scanning. Switch to the shared page, scroll slowly to the bottom, then come back here \
-             (or click Done).",
+            "Scanning. Switch to the shared page and follow the advisor's spoken directions; come back \
+             here, say \u{201c}done,\u{201d} or click Done to finish.",
             false,
         );
         self.render();
     }
 
-    /// Ends the scan normally and returns to the pre-scan viewing state.
+    /// Speaks scan guidance (in the advisor's voice) and shows it here too.
+    fn say_cue(&self, cue: ScanCue) {
+        self.ws_send(&ClientMsg::ScanCue { cue });
+        let warn = matches!(cue, ScanCue::TooFar | ScanCue::TooFast);
+        self.set_status(cue.phrase(), warn);
+    }
+
+    /// Ends the scan normally, thanks the user, and returns to the pre-scan
+    /// viewing state.
     fn finish_scan(&self, why: &str) {
+        if self.scanning() {
+            self.say_cue(ScanCue::Finished);
+        }
+        self.finish_scan_quietly(why);
+    }
+
+    fn finish_scan_quietly(&self, why: &str) {
         let Some(c) = self.capture() else { return };
         let Some(summary) = c.end_scan() else { return };
         self.ws_send(&ClientMsg::EndScan { scan_id: summary.scan_id });
@@ -422,16 +438,12 @@ impl CallView {
                 self.ws_send(&ClientMsg::SetViewing { viewing: false });
                 self.set_status("Screen sharing stopped.", false);
             }
-            CaptureEvent::Segment { segments, gap_before } => {
-                self.scan_segments.set(segments);
-                if gap_before {
-                    self.set_status(
-                        "You may have skipped part of the page. Scroll back up a little, then continue slowly.",
-                        true,
-                    );
-                }
+            CaptureEvent::Segment { segments, .. } => self.scan_segments.set(segments),
+            CaptureEvent::ScanFull => {
+                self.say_cue(ScanCue::Full);
+                self.finish_scan_quietly("it reached the segment limit");
             }
-            CaptureEvent::ScanFull => self.finish_scan("it reached the segment limit"),
+            CaptureEvent::Cue(cue) => self.say_cue(cue),
         }
         self.render();
     }

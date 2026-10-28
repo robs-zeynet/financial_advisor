@@ -49,6 +49,61 @@ pub fn is_scan_command(text: &str) -> bool {
     )
 }
 
+/// Spoken guidance during a page scan. The browser decides when (it sees the
+/// scroll); the server speaks it in the advisor's voice. Never sent to Claude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "cue", rename_all = "snake_case")]
+pub enum ScanCue {
+    /// The scan started: go to the top and hold still.
+    Begin,
+    /// A segment was captured; `segments` so far. Scroll on.
+    Captured { segments: u32 },
+    /// Far enough for the next segment: stop scrolling.
+    Stop,
+    /// Scrolling faster than the capture can follow.
+    TooFast,
+    /// Past the last segment with no overlap: scroll back up a little.
+    TooFar,
+    /// Stopped, but not far enough for a new segment.
+    KeepGoing,
+    /// A short final step was kept; probably the bottom.
+    MaybeBottom,
+    /// No movement for a while after a capture.
+    StillThere,
+    /// The scan hit its segment limit.
+    Full,
+    /// The user finished the scan.
+    Finished,
+}
+
+impl ScanCue {
+    /// What the advisor says (and the app shows). Polite and short; captures
+    /// rotate through a few phrasings so it doesn't sound robotic.
+    pub fn phrase(&self) -> &'static str {
+        match self {
+            Self::Begin => {
+                "Let's go through this page together. Please scroll to the very top, then hold still for a moment."
+            }
+            Self::Captured { segments: 1 } => {
+                "Thank you, I have the top. Now please scroll down slowly, and I'll tell you when to stop."
+            }
+            Self::Captured { segments } => match segments % 3 {
+                0 => "Got it, thank you. Please scroll down again.",
+                1 => "Thanks. A little further down, please.",
+                _ => "Got it. Please keep scrolling slowly.",
+            },
+            Self::Stop => "That's good, please stop there.",
+            Self::TooFast => "Could you go a little slower, please?",
+            Self::TooFar => "Oops, I think we skipped a bit. Could you scroll back up a little, please?",
+            Self::KeepGoing => "Just a little further down, please.",
+            Self::MaybeBottom => "Thank you. If that's the bottom of the page, just say done.",
+            Self::StillThere => "Whenever you're ready, please scroll down a bit more, or say done if that's the end.",
+            Self::Full => "That's as much as I can take in one scan. Thank you, I'll have a look now.",
+            Self::Finished => "Thank you, I've got the page.",
+        }
+    }
+}
+
 /// Commands recognized in speech and handled locally, never sent to Claude
 /// (except "pause viewing", which pauses first and then reaches the model).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +174,11 @@ pub enum ClientMsg {
     StartScan { scan_id: u32 },
     /// The user finished the page scan.
     EndScan { scan_id: u32 },
+    /// Speak this scan guidance to the user now.
+    ScanCue {
+        #[serde(flatten)]
+        cue: ScanCue,
+    },
     /// Typed user input. Spoken input arrives as `TAG_MIC_PCM` audio.
     UserText { text: String },
     /// The mic was switched on or off. Off discards any partial utterance.
@@ -492,6 +552,33 @@ mod tests {
         assert_eq!(spoken_command("Pause viewing, please."), Some(PauseViewing));
         assert_eq!(spoken_command("Can you scan this page and tell me the fees?"), None);
         assert_eq!(spoken_command("I'm done with my taxes, what about dividends?"), None);
+    }
+
+    #[test]
+    fn scan_cues_are_polite_and_serialize() {
+        let all = [
+            ScanCue::Begin,
+            ScanCue::Captured { segments: 1 },
+            ScanCue::Captured { segments: 2 },
+            ScanCue::Stop,
+            ScanCue::TooFast,
+            ScanCue::TooFar,
+            ScanCue::KeepGoing,
+            ScanCue::MaybeBottom,
+            ScanCue::StillThere,
+            ScanCue::Full,
+            ScanCue::Finished,
+        ];
+        for cue in all {
+            let p = cue.phrase().to_lowercase();
+            assert!(p.contains("please") || p.contains("thank"), "{cue:?}: {p}");
+            let msg = ClientMsg::ScanCue { cue };
+            assert_eq!(serde_json::from_str::<ClientMsg>(&serde_json::to_string(&msg).unwrap()).unwrap(), msg);
+        }
+        assert_eq!(
+            serde_json::to_string(&ClientMsg::ScanCue { cue: ScanCue::Captured { segments: 3 } }).unwrap(),
+            r#"{"type":"scan_cue","cue":"captured","segments":3}"#
+        );
     }
 
     #[test]

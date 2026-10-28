@@ -6,6 +6,8 @@
 //! already takes: for each candidate vertical shift, compare the overlapping
 //! rows of the previous and current thumbnails and keep the best match.
 
+use protocol::ScanCue;
+
 use crate::capture::{DHash, THUMB_H, THUMB_W};
 
 /// Shifts with fewer overlapping rows than this aren't considered.
@@ -124,18 +126,67 @@ pub struct SegmentInfo {
 pub struct ScanSummary {
     pub scan_id: u32,
     pub segments: u32,
+    /// Segments kept despite a gap (the user held still after being asked to
+    /// scroll back).
     pub gaps: u32,
     /// Achieved sampling rate; low when the browser throttled a background tab.
     pub samples_per_sec: f64,
 }
 
-/// Progress of the scan in flight.
+// Guidance tuning, in thumbnail rows (256 = one screen) and milliseconds.
+
+/// New content needed for a segment: about a third of a screen. Smaller
+/// steps (or lingering) don't make near-duplicate segments.
+pub const MIN_ADVANCE_ROWS: i32 = 90;
+/// While scrolling, ask the user to stop at a bit over half a screen.
+pub const STOP_AT_ROWS: i32 = 140;
+/// Time to hear "please scroll to the top" before the first capture.
+pub const FIRST_CAPTURE_DELAY_MS: f64 = 3_000.0;
+/// The first capture also needs the view to have been still this long.
+pub const FIRST_DWELL_MS: f64 = 1_000.0;
+/// Stopped short of a full step for this long: "a little further, please".
+pub const KEEP_GOING_AFTER_MS: f64 = 1_200.0;
+/// Stopped short for this long: keep it anyway (usually the bottom).
+pub const ACCEPT_SHORT_AFTER_MS: f64 = 3_000.0;
+/// Held still past a gap this long after being asked to scroll back: keep
+/// it, marked as a gap.
+pub const ACCEPT_GAP_AFTER_MS: f64 = 6_000.0;
+/// No movement this long after a capture: a gentle nudge.
+pub const STILL_THERE_AFTER_MS: f64 = 7_000.0;
+/// The same cue isn't repeated sooner than this...
+const REPEAT_CUE_MS: f64 = 4_000.0;
+/// ...and routine cues are at least this far apart.
+const MIN_CUE_GAP_MS: f64 = 1_500.0;
+/// Speed is only judged when samples are this close together (a throttled
+/// background tab samples too slowly to tell).
+const FAST_SAMPLE_MS: f64 = 400.0;
+
+/// What one sample led to: maybe a segment, maybe something to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Observation {
+    pub segment: Option<SegmentInfo>,
+    pub cue: Option<ScanCue>,
+}
+
+/// Progress of the scan in flight, and the guidance state behind it.
 #[derive(Debug, Clone)]
 pub struct ScanProgress {
     pub scan_id: u32,
     pub segments: u32,
     pub gaps: u32,
     last_segment: Option<(DHash, Vec<u8>)>,
+    last_capture_ms: f64,
+    started_ms: Option<f64>,
+    /// The previous sample, for judging scroll speed.
+    prev_sample: Option<(f64, Vec<u8>)>,
+    /// When the view last became still.
+    settled_since: Option<f64>,
+    /// "Stop" was said since the last capture.
+    stop_cued: bool,
+    /// The user scrolled past the last segment and was asked to come back.
+    skipped: bool,
+    still_cued: bool,
+    last_cue: Option<(ScanCue, f64)>,
     samples: u32,
     first_sample_ms: Option<f64>,
     last_sample_ms: f64,
@@ -148,41 +199,144 @@ impl ScanProgress {
             segments: 0,
             gaps: 0,
             last_segment: None,
+            last_capture_ms: 0.0,
+            started_ms: None,
+            prev_sample: None,
+            settled_since: None,
+            stop_cued: false,
+            skipped: false,
+            still_cued: false,
+            last_cue: None,
             samples: 0,
             first_sample_ms: None,
             last_sample_ms: 0.0,
         }
     }
 
-    pub fn note_sample(&mut self, now_ms: f64) {
+    fn note_sample(&mut self, now_ms: f64) {
         self.samples += 1;
         self.first_sample_ms.get_or_insert(now_ms);
         self.last_sample_ms = now_ms;
     }
 
-    /// Decides whether a settled sample becomes the next segment.
-    pub fn consider(&mut self, hash: DHash, thumb: &[u8], change_threshold_bits: u32) -> Option<SegmentInfo> {
-        let (offset_rows, gap_before) = match &self.last_segment {
-            None => (None, false),
-            Some((last_hash, _)) if last_hash.distance(&hash) < change_threshold_bits => return None,
-            Some((_, last_thumb)) => match estimate_offset(last_thumb, thumb) {
-                Offset::Rows(r) => (Some(r), false),
-                Offset::Gap => (None, true),
-                Offset::Unknown => (None, false),
-            },
-        };
-        let info = SegmentInfo {
-            scan_id: self.scan_id,
-            segment_index: self.segments as u16,
-            offset_rows,
-            gap_before,
-        };
+    /// Rate-limits cues. `urgent` cues (stop, skipped, captured) only skip the
+    /// repeat check for a different cue.
+    fn cue(&mut self, now: f64, cue: ScanCue, urgent: bool) -> Option<ScanCue> {
+        if let Some((last, at)) = self.last_cue {
+            let same = std::mem::discriminant(&last) == std::mem::discriminant(&cue);
+            if same && now - at < REPEAT_CUE_MS {
+                return None;
+            }
+            if !urgent && now - at < MIN_CUE_GAP_MS {
+                return None;
+            }
+        }
+        self.last_cue = Some((cue, now));
+        Some(cue)
+    }
+
+    fn capture(&mut self, now: f64, hash: DHash, thumb: &[u8], offset_rows: Option<i32>, gap_before: bool) -> SegmentInfo {
+        let info = SegmentInfo { scan_id: self.scan_id, segment_index: self.segments as u16, offset_rows, gap_before };
         self.segments += 1;
         if gap_before {
             self.gaps += 1;
         }
         self.last_segment = Some((hash, thumb.to_vec()));
-        Some(info)
+        self.last_capture_ms = now;
+        self.stop_cued = false;
+        self.skipped = false;
+        self.still_cued = false;
+        info
+    }
+
+    /// Feeds one sample. Decides whether it becomes the next segment and
+    /// what, if anything, to tell the user.
+    pub fn observe(&mut self, now: f64, hash: DHash, thumb: &[u8], settled: bool, change_threshold_bits: u32) -> Observation {
+        self.note_sample(now);
+        let started = *self.started_ms.get_or_insert(now);
+        let prev = self.prev_sample.replace((now, thumb.to_vec()));
+        if settled {
+            self.settled_since.get_or_insert(now);
+        } else {
+            self.settled_since = None;
+        }
+        let dwell = self.settled_since.map_or(0.0, |t| now - t);
+
+        // First segment: give the user time to get to the top and hold still.
+        let Some((last_hash, last_thumb)) = self.last_segment.clone() else {
+            if settled && now - started >= FIRST_CAPTURE_DELAY_MS && dwell >= FIRST_DWELL_MS {
+                let segment = self.capture(now, hash, thumb, None, false);
+                let cue = self.cue(now, ScanCue::Captured { segments: self.segments }, true);
+                return Observation { segment: Some(segment), cue };
+            }
+            return Observation::default();
+        };
+
+        if !settled {
+            // Moving: slow down if consecutive samples don't even overlap; say
+            // stop at about half a screen; past a full screen, ask to go back.
+            let too_fast = matches!(&prev, Some((t, p)) if now - t <= FAST_SAMPLE_MS && estimate_offset(p, thumb) == Offset::Gap);
+            let cue = if too_fast {
+                self.cue(now, ScanCue::TooFast, true)
+            } else {
+                match estimate_offset(&last_thumb, thumb) {
+                    Offset::Rows(r) if r >= STOP_AT_ROWS && !self.stop_cued => {
+                        self.stop_cued = true;
+                        self.cue(now, ScanCue::Stop, true)
+                    }
+                    Offset::Gap if !self.skipped => {
+                        self.skipped = true;
+                        self.cue(now, ScanCue::TooFar, true)
+                    }
+                    _ => None,
+                }
+            };
+            return Observation { segment: None, cue };
+        }
+
+        // Still, and nothing new since the last capture.
+        if last_hash.distance(&hash) < change_threshold_bits {
+            let cue = if !self.still_cued && now - self.last_capture_ms >= STILL_THERE_AFTER_MS {
+                self.still_cued = true;
+                self.cue(now, ScanCue::StillThere, false)
+            } else {
+                None
+            };
+            return Observation { segment: None, cue };
+        }
+
+        match estimate_offset(&last_thumb, thumb) {
+            Offset::Rows(r) if r >= MIN_ADVANCE_ROWS => {
+                let segment = self.capture(now, hash, thumb, Some(r), false);
+                let cue = self.cue(now, ScanCue::Captured { segments: self.segments }, true);
+                Observation { segment: Some(segment), cue }
+            }
+            Offset::Rows(r) if r > 0 && dwell >= ACCEPT_SHORT_AFTER_MS => {
+                // A short last step, held: usually the bottom of the page.
+                let segment = self.capture(now, hash, thumb, Some(r), false);
+                let cue = self.cue(now, ScanCue::MaybeBottom, true);
+                Observation { segment: Some(segment), cue }
+            }
+            Offset::Rows(_) if dwell >= KEEP_GOING_AFTER_MS => {
+                Observation { segment: None, cue: self.cue(now, ScanCue::KeepGoing, false) }
+            }
+            Offset::Rows(_) => Observation::default(),
+            Offset::Gap if self.skipped && dwell >= ACCEPT_GAP_AFTER_MS => {
+                // They held still past the gap; keep it, flagged.
+                let segment = self.capture(now, hash, thumb, None, true);
+                let cue = self.cue(now, ScanCue::Captured { segments: self.segments }, true);
+                Observation { segment: Some(segment), cue }
+            }
+            Offset::Gap => {
+                self.skipped = true;
+                Observation { segment: None, cue: self.cue(now, ScanCue::TooFar, true) }
+            }
+            Offset::Unknown => {
+                let segment = self.capture(now, hash, thumb, None, false);
+                let cue = self.cue(now, ScanCue::Captured { segments: self.segments }, true);
+                Observation { segment: Some(segment), cue }
+            }
+        }
     }
 
     pub fn summary(&self) -> ScanSummary {

@@ -18,6 +18,8 @@ use web_sys::{
 };
 
 use crate::dom;
+use protocol::ScanCue;
+
 use crate::scan::{rows_to_px, ScanProgress, ScanSummary, SegmentInfo};
 use crate::ws::Ws;
 
@@ -104,6 +106,8 @@ pub struct CaptureState {
     last_sent: Option<DHash>,
     last_sent_ms: f64,
     scan: Option<ScanProgress>,
+    /// Guidance to speak, taken by the loop after each tick.
+    pending_cue: Option<ScanCue>,
 }
 
 impl CaptureState {
@@ -116,7 +120,13 @@ impl CaptureState {
             last_sent: None,
             last_sent_ms: 0.0,
             scan: None,
+            pending_cue: None,
         }
+    }
+
+    /// The latest guidance cue, if any, since the last call.
+    pub fn take_cue(&mut self) -> Option<ScanCue> {
+        self.pending_cue.take()
     }
 
     pub fn mode(&self) -> Mode {
@@ -162,6 +172,7 @@ impl CaptureState {
     pub fn pause(&mut self) -> Option<ScanSummary> {
         self.mode = Mode::Paused;
         self.reset_sampling();
+        self.pending_cue = None;
         self.scan.take().map(|s| s.summary())
     }
 
@@ -175,6 +186,7 @@ impl CaptureState {
         self.mode = Mode::Scanning { scan_id, resume_viewing };
         self.scan = Some(ScanProgress::new(scan_id));
         self.reset_sampling();
+        self.pending_cue = Some(ScanCue::Begin);
     }
 
     /// Finishes the scan and returns to the pre-scan state.
@@ -182,6 +194,7 @@ impl CaptureState {
         let Mode::Scanning { resume_viewing, .. } = self.mode else { return None };
         self.mode = if resume_viewing { Mode::Viewing } else { Mode::Paused };
         self.reset_sampling();
+        self.pending_cue = None;
         self.scan.take().map(|s| s.summary())
     }
 
@@ -230,11 +243,11 @@ impl CaptureState {
         self.prev_sample = Some(hash);
 
         if let Some(scan) = self.scan.as_mut() {
-            scan.note_sample(now_ms);
-            if !settled {
-                return None;
+            let obs = scan.observe(now_ms, hash, &thumb, settled, threshold);
+            if obs.cue.is_some() {
+                self.pending_cue = obs.cue;
             }
-            return scan.consider(hash, &thumb, threshold).map(|info| SendFrame { changed: true, scan: Some(info) });
+            return obs.segment.map(|info| SendFrame { changed: true, scan: Some(info) });
         }
 
         let changed = self.last_sent.is_none_or(|l| l.distance(&hash) >= threshold);
@@ -275,6 +288,8 @@ pub enum CaptureEvent {
     Segment { segments: u32, gap_before: bool },
     /// The scan reached its segment cap.
     ScanFull,
+    /// Guidance to speak to the user.
+    Cue(ScanCue),
 }
 
 type EventSink = Rc<RefCell<Option<Box<dyn Fn(CaptureEvent)>>>>;
@@ -454,7 +469,12 @@ impl Capturer {
         }
         let mut src = VideoThumb { video: &self.video, thumb: &self.thumb };
         let now = js_sys::Date::now();
-        let Some(send) = self.state.borrow_mut().tick(now, &mut src) else { return };
+        let send = self.state.borrow_mut().tick(now, &mut src);
+        let cue = self.state.borrow_mut().take_cue();
+        if let Some(cue) = cue {
+            self.emit(CaptureEvent::Cue(cue));
+        }
+        let Some(send) = send else { return };
         let settings = self.state.borrow().settings();
         let (w, h) = scaled_size(self.video.video_width(), self.video.video_height(), settings.max_long_edge);
         let mut header = FrameHeader::live(now as u64, w as u16, h as u16, send.changed);

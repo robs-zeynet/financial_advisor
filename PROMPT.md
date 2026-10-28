@@ -260,33 +260,54 @@ A page longer than one screen can't be understood from the live ring: it holds
 only 5 frames, and context editing clears older looks. A **page scan** captures
 the whole page as an ordered set of overlapping segments.
 
-- **Flow:**
-  1. I scroll the shared page to the top.
-  2. I start a scan: the **Scan page** button, `Ctrl+Shift+S`, or saying or
+- **Flow (guided):**
+  1. I start a scan: the **Scan page** button, `Ctrl+Shift+S`, or saying or
      typing "scan this page". The advisor can also ask me to scan when it sees
      a page that continues below the fold.
-  3. I scroll slowly to the bottom of the page in the shared tab.
-  4. The scan ends when I click **Done**, say or type "done", or return focus
+  2. The advisor then **directs me out loud**, politely, in its own voice:
+     scroll to the top and hold still, scroll down slowly, stop here, a
+     little slower, you skipped a bit (scroll back up), a little further,
+     thank you. I don't have to judge speed or spacing myself.
+  3. The scan ends when I click **Done**, say or type "done", or return focus
      to the app tab (`visibilitychange`/`focus`; this is the natural end in
      text mode). It also ends automatically when it reaches
      `max_scan_segments`.
-- **Capture during a scan:** sample at about 4 fps. Emit a segment each time
-  the view settles on content meaningfully different from the last segment.
+- **Guidance runs locally, not through Claude.** The browser sees the scroll
+  in real time and picks a cue; the server speaks it with the TTS voice. A
+  Claude round trip per cue would be seconds too slow and would send
+  screenshots for every step. Cues are never added to the conversation, and
+  talking over a cue isn't treated as interrupting a reply. Cues are
+  rate-limited so they don't nag (the same cue at most every 4 s, routine
+  cues at least 1.5 s apart). With spoken replies off, cues are shown in the
+  app only.
+- **Capture rules during a scan:** sample at about 4 fps.
+  - The first segment is taken after a few seconds (time to hear "scroll to
+    the top") once the view has been still for about a second.
+  - A new segment needs the view to be still **and** at least about a third
+    of a screen of new content. Lingering or tiny scrolls make no duplicates;
+    after a short pause they get "a little further, please". A short final
+    step that's held for about 3 seconds is kept (usually the bottom).
+  - While scrolling, the user is asked to stop at about half a screen, and
+    to slow down when consecutive samples don't even overlap.
+  - Past a full screen with no overlap, nothing is captured; the user is
+    asked to scroll back up until the view overlaps the last segment. If they
+    hold still there for about 6 seconds instead, the segment is kept and
+    flagged as a possible gap.
 - **Scroll-offset estimate (client, Rust):** for each new segment, estimate
   its vertical offset from the previous one by matching row signatures
   (per-row luminance on a narrow grayscale thumbnail, about 64×256) over
   candidate shifts.
   - Report the estimate, or "unknown".
-  - Report a **possible gap** when no shift gives a good overlap. That means I
-    scrolled more than a screen between settles. The UI tells me right away to
-    scroll back up a little.
+  - A **gap** is when no shift gives a good overlap: I scrolled more than a
+    screen. The guidance above asks me to go back rather than recording it.
   - Horizontal scrolling isn't handled in v1. For wide tables the advisor asks
     me to zoom out (`Ctrl -`) instead.
 - **Wire format:** the frame header gains `scan_id` (0 = live frame),
   `segment_index`, `offset_px` (estimated, in segment pixels, or unknown), and
   a `gap_before` flag.
-  - New control messages: `StartScan`, `EndScan` (client → server) and
-    `ScanState { active, scan_id, segments, gaps }` (server → client).
+  - New control messages: `StartScan`, `EndScan`, `ScanCue { cue }`
+    (client → server) and `ScanState { active, scan_id, segments, gaps }`
+    (server → client).
 - **Server:** keeps the segments of the most recent scan in the scan buffer
   (P3), ordered by `segment_index`. When a scan ends, the server queues a
   mid-conversation system note for the next request, for example: "The user
@@ -495,6 +516,7 @@ mode, before voice exists.
   - `view_screen` `scope: "scan"` with labeled segments and gap callouts
   - the scan-ended system note and the moving cache breakpoint
   - UI: Scan page/Done, the 🔴 SCANNING (n) indicator, and gap warnings
+    (later refined into spoken, guided scans: see "Long pages")
   - text-mode scan control: the button, `Ctrl+Shift+S`, typed "scan this page"
     / "done", and refocusing the app tab
   - the Appendix A update
@@ -569,9 +591,12 @@ mode, before voice exists.
 11. **Scan capture test (client, `wasm-bindgen-test`).** Feed the state
     machine synthetic frames cut from one tall image at known scroll offsets.
     - No segment is emitted mid-scroll (unsettled); one is emitted per settled
-      position.
+      step of at least a third of a screen, and none for lingering or tiny
+      scrolls.
     - Estimated offsets are within ±5% of the true offsets.
-    - A jump larger than one screen is flagged as a gap.
+    - The guidance cues fire: begin, stop, too fast, too far (with no segment
+      captured until the view overlaps again), keep going, maybe bottom, and
+      a flagged gap only after holding still past one.
     - Nothing is read or emitted while PAUSED, or after an explicit pause
       cancels a scan.
     - After a scan started from PAUSED ends, the machine is PAUSED again.

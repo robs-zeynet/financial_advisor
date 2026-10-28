@@ -161,6 +161,11 @@ async fn connection(app: Arc<AppState>, socket: WebSocket) {
                         Some(s) => s.user_text(text),
                         None => send(ServerMsg::Error { message: "start a call first".into() }),
                     },
+                    ClientMsg::ScanCue { cue } => {
+                        if let Some(s) = session.as_mut() {
+                            s.say_cue(cue);
+                        }
+                    }
                     ClientMsg::MicState { on } => {
                         if let Some(s) = session.as_mut() {
                             s.mic_state(on);

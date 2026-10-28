@@ -25,7 +25,7 @@ use crate::frames::{FrameRing, ScanBuffer, ScanReject};
 use crate::memory;
 use crate::screen_notes::ScreenNotes;
 use crate::stt::SpeechToText;
-use crate::tts::{SentenceChunker, Speaker, TtsEngine};
+use crate::tts::{SentenceChunker, Speaker, TtsEngine, UtteranceKind};
 use crate::vad::{Vad, VadEvent};
 
 pub struct AppState {
@@ -255,6 +255,15 @@ impl Session {
         self.send(ServerMsg::ViewingState { viewing: false });
     }
 
+    /// Speaks page-scan guidance chosen by the browser. Spoken only; it never
+    /// enters the conversation. Silently skipped when replies aren't spoken.
+    pub fn say_cue(&mut self, cue: protocol::ScanCue) {
+        if let Some(speaker) = &self.speaker {
+            tracing::debug!(?cue, "scan guidance");
+            speaker.announce(cue.phrase());
+        }
+    }
+
     /// The user started a page scan: an explicit, bounded period of viewing.
     pub fn start_scan(&mut self, scan_id: u32) {
         let mut s = self.shared.lock().unwrap();
@@ -449,9 +458,9 @@ impl Session {
     /// system note tells the model how much the user actually heard.
     pub fn interrupt(&mut self) {
         if let Some(speaker) = &self.speaker {
-            let was_speaking = speaker.stop();
+            let stopped = speaker.stop();
             let mut s = self.shared.lock().unwrap();
-            if was_speaking && !s.turn_running {
+            if stopped.active && stopped.kind == UtteranceKind::Reply && !s.turn_running {
                 let heard = speaker.heard_prefix().unwrap_or(0).min(s.last_reply.len());
                 let mut cut = heard;
                 while !s.last_reply.is_char_boundary(cut) {

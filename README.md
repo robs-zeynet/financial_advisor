@@ -30,16 +30,20 @@ tab…** (pick a single tab or window). Viewing stays ⚪ PAUSED until you click
 
 ### Long pages
 
-Scroll the shared page to the top, click **Scan page** (or Ctrl+Shift+S, or
-type "scan this page"), then switch to the shared page and scroll slowly to
-the bottom, pausing briefly at each screenful. Come back to the app (or click
-**Done**, or type "done") to finish. The advisor is told a scan is available
-and looks at it with `view_screen` (scope `scan`). A scan started while paused
-returns to paused when it ends.
+Click **Scan page** (or Ctrl+Shift+S, or say or type "scan this page"), then
+switch to the shared page. The advisor guides you out loud: scroll to the top
+and hold still, scroll down slowly, "please stop there", "a little slower",
+"I think we skipped a bit, could you scroll back up?", "a little further".
+It only keeps a new snapshot after about a third of a screen of new content,
+so lingering doesn't make duplicates, and it won't skip ahead past content
+it missed. Say "done" (or come back to the app, or click **Done**) at the
+bottom. The guidance is decided locally and spoken by the local voice; it
+never goes to Claude. A scan started while paused returns to paused when it
+ends.
 
 Browsers slow timers in background tabs, so if the app and the shared page
-are tabs in the same window, scans sample about once a second instead of four
-times. Keeping the app in its own window avoids that.
+are tabs in the same window, scans can sample about once a second instead of
+four times. Keeping the app in its own window avoids that.
 
 ### Screen notes
 

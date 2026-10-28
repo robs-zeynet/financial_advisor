@@ -1,11 +1,12 @@
-//! Acceptance test 11: the page-scan state machine against a synthetic tall
-//! page scrolled to known offsets.
+//! Acceptance test 11: the guided page-scan state machine against a
+//! synthetic tall page scrolled to known offsets: segments, offsets, and the
+//! spoken guidance (start, stop, slow down, go back, keep going).
 //!
 //! Run headless with: `wasm-pack test --headless --chrome crates/client`
 
 use client::capture::{CaptureState, Mode, ThumbSource, THUMB_H, THUMB_W};
 use client::scan::{estimate_offset, rows_to_px, Offset, SegmentInfo};
-use protocol::CaptureSettings;
+use protocol::{CaptureSettings, ScanCue};
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -90,6 +91,7 @@ struct Sim<'a> {
     now: f64,
     segments: Vec<SegmentInfo>,
     live_frames: u32,
+    cues: Vec<ScanCue>,
 }
 
 impl<'a> Sim<'a> {
@@ -100,6 +102,7 @@ impl<'a> Sim<'a> {
             now: 0.0,
             segments: Vec::new(),
             live_frames: 0,
+            cues: Vec::new(),
         }
     }
 
@@ -111,6 +114,18 @@ impl<'a> Sim<'a> {
                 None => self.live_frames += 1,
             }
         }
+        self.cues.extend(self.state.take_cue());
+    }
+
+    /// Starts a scan at the top and waits for the first capture.
+    fn start_at_top(&mut self, scan_id: u32) {
+        self.state.start_scan(scan_id);
+        self.scroll_to(0, 100, 16); // 4 s: hears the instructions, holds still
+        assert_eq!(self.segments.len(), 1, "the top is captured after a moment");
+    }
+
+    fn has_cue(&self, f: impl Fn(&ScanCue) -> bool) -> bool {
+        self.cues.iter().any(f)
     }
 
     /// Scrolls to `target` in `step`-px moves (one per tick), then rests for
@@ -131,60 +146,120 @@ impl<'a> Sim<'a> {
 }
 
 #[wasm_bindgen_test]
-fn one_segment_per_settled_position_with_accurate_offsets() {
+fn guided_scan_captures_each_step_with_accurate_offsets() {
     let page = Page::new(0x5eed);
     let mut sim = Sim::new(&page, CaptureSettings::default());
-    sim.state.start_scan(1);
-    let stops = [0usize, 700, 1400, 2100, 2800, PAGE_H - VIEW_H];
-    sim.scroll_to(stops[0], 100, 3);
+    sim.start_at_top(1);
+    assert_eq!(sim.cues[..2], [ScanCue::Begin, ScanCue::Captured { segments: 1 }]);
+    let stops = [0usize, 700, 1400, 2100, 2800];
     for &stop in &stops[1..] {
         sim.scroll_to(stop, 100, 3);
     }
-    assert_eq!(sim.segments.len(), stops.len(), "one segment per settled position: {:?}", sim.segments);
+    // The last screenful is a short step: "a little further", then kept as
+    // probably the bottom.
+    sim.scroll_to(PAGE_H - VIEW_H, 100, 14);
+    let all_stops: Vec<usize> = stops.iter().copied().chain([PAGE_H - VIEW_H]).collect();
+    assert_eq!(sim.segments.len(), all_stops.len(), "one segment per stop: {:?}", sim.segments);
     assert_eq!(sim.live_frames, 0);
     assert!(sim.segments.iter().all(|s| s.scan_id == 1 && !s.gap_before));
-    for (i, seg) in sim.segments.iter().enumerate() {
+    for (i, seg) in sim.segments.iter().enumerate().skip(1) {
         assert_eq!(seg.segment_index as usize, i);
-        if i == 0 {
-            assert_eq!(seg.offset_rows, None);
-            continue;
-        }
-        let truth = (stops[i] - stops[i - 1]) as f64;
+        let truth = (all_stops[i] - all_stops[i - 1]) as f64;
         let est = rows_to_px(seg.offset_rows.expect("offset known"), VIEW_H as u32) as f64;
         assert!((est - truth).abs() <= truth * 0.05, "segment {i}: estimated {est}, true {truth}");
     }
+    // Told when to stop on each long step, and thanked for each capture.
+    assert_eq!(sim.cues.iter().filter(|c| **c == ScanCue::Stop).count(), 4);
+    for n in 2..=5 {
+        assert!(sim.has_cue(|c| *c == ScanCue::Captured { segments: n }), "thanked for segment {n}");
+    }
+    assert!(sim.has_cue(|c| *c == ScanCue::KeepGoing));
+    assert_eq!(sim.cues.last(), Some(&ScanCue::MaybeBottom));
+}
+
+#[wasm_bindgen_test]
+fn lingering_and_tiny_scrolls_make_no_duplicates() {
+    let page = Page::new(11);
+    let mut sim = Sim::new(&page, CaptureSettings::default());
+    sim.start_at_top(1);
+    // Small nudges with pauses: not enough new content for a segment.
+    for y in [100, 200, 300] {
+        sim.scroll_to(y, 100, 6);
+    }
+    assert_eq!(sim.segments.len(), 1, "no near-duplicate segments");
+    assert!(sim.has_cue(|c| *c == ScanCue::KeepGoing), "asked to scroll a little further");
+    sim.scroll_to(600, 100, 3);
+    assert_eq!(sim.segments.len(), 2);
+    // Lingering in place adds nothing, and eventually gets a gentle nudge.
+    for _ in 0..40 {
+        sim.tick();
+    }
+    assert_eq!(sim.segments.len(), 2);
+    assert!(sim.has_cue(|c| *c == ScanCue::StillThere));
+}
+
+#[wasm_bindgen_test]
+fn scrolling_too_far_asks_to_go_back_instead_of_leaving_a_gap() {
+    let page = Page::new(42);
+    let mut sim = Sim::new(&page, CaptureSettings::default());
+    sim.start_at_top(3);
+    sim.src.y = 2200; // more than a screen below the last capture
+    sim.tick();
+    sim.tick();
+    sim.tick();
+    assert!(sim.has_cue(|c| *c == ScanCue::TooFar));
+    assert_eq!(sim.segments.len(), 1, "nothing captured past the gap");
+    // Back up until it overlaps where we left off.
+    sim.scroll_to(800, 100, 3);
+    assert_eq!(sim.segments.len(), 2);
+    assert!(!sim.segments[1].gap_before);
+    let est = rows_to_px(sim.segments[1].offset_rows.unwrap(), VIEW_H as u32);
+    assert!((est - 800).abs() <= 40, "offset {est}");
+    assert_eq!(sim.state.scan_progress().unwrap().gaps, 0);
+}
+
+#[wasm_bindgen_test]
+fn holding_still_past_a_gap_keeps_it_flagged() {
+    let page = Page::new(43);
+    let mut sim = Sim::new(&page, CaptureSettings::default());
+    sim.start_at_top(1);
+    sim.src.y = 2400;
+    for _ in 0..30 {
+        sim.tick(); // 7.5 s without scrolling back
+    }
+    assert_eq!(sim.segments.len(), 2);
+    assert!(sim.segments[1].gap_before);
+    assert_eq!(sim.state.scan_progress().unwrap().gaps, 1);
+}
+
+#[wasm_bindgen_test]
+fn scrolling_fast_asks_to_slow_down() {
+    let page = Page::new(7);
+    let mut sim = Sim::new(&page, CaptureSettings::default());
+    sim.start_at_top(1);
+    sim.src.y = 1100;
+    sim.tick();
+    sim.src.y = 2200;
+    sim.tick();
+    assert!(sim.has_cue(|c| *c == ScanCue::TooFast), "cues: {:?}", sim.cues);
+    assert_eq!(sim.segments.len(), 1);
 }
 
 #[wasm_bindgen_test]
 fn nothing_is_emitted_mid_scroll() {
-    let page = Page::new(7);
+    let page = Page::new(8);
     let mut sim = Sim::new(&page, CaptureSettings::default());
-    sim.state.start_scan(1);
-    sim.tick(); // first sample, unsettled
+    sim.start_at_top(1);
     // Keep scrolling without ever stopping.
-    for _ in 0..25 {
-        sim.src.y += 120;
+    for _ in 0..6 {
+        sim.src.y += 100;
         sim.tick();
     }
-    assert!(sim.segments.is_empty(), "no segment while the view keeps moving");
-    sim.tick();
-    assert_eq!(sim.segments.len(), 1, "one segment once it settles");
-}
-
-#[wasm_bindgen_test]
-fn jump_larger_than_a_screen_is_a_gap() {
-    let page = Page::new(42);
-    let mut sim = Sim::new(&page, CaptureSettings::default());
-    sim.state.start_scan(3);
-    sim.scroll_to(0, 100, 2);
-    sim.src.y = 2200; // more than VIEW_H below: no overlap
+    assert_eq!(sim.segments.len(), 1, "no segment while the view keeps moving");
+    assert!(sim.has_cue(|c| *c == ScanCue::Stop), "told to stop once far enough");
     sim.tick();
     sim.tick();
-    sim.scroll_to(2600, 100, 2); // normal overlap again
-    let gaps: Vec<bool> = sim.segments.iter().map(|s| s.gap_before).collect();
-    assert_eq!(gaps, vec![false, true, false]);
-    assert_eq!(sim.segments[1].offset_rows, None);
-    assert_eq!(sim.state.scan_progress().unwrap().gaps, 1);
+    assert_eq!(sim.segments.len(), 2, "one segment once it settles");
 }
 
 #[wasm_bindgen_test]
@@ -210,8 +285,7 @@ fn paused_reads_nothing_and_pause_cancels_a_scan() {
     }
     assert_eq!(sim.src.reads, 0, "PAUSED: the screen is never read");
 
-    sim.state.start_scan(5);
-    sim.scroll_to(0, 100, 2);
+    sim.start_at_top(5);
     sim.scroll_to(800, 100, 2);
     assert_eq!(sim.segments.len(), 2);
 
@@ -219,10 +293,11 @@ fn paused_reads_nothing_and_pause_cancels_a_scan() {
     assert_eq!(cancelled.segments, 2);
     assert_eq!(sim.state.mode(), Mode::Paused);
     assert!(sim.state.scan_progress().is_none());
-    let reads = sim.src.reads;
+    let (reads, cues) = (sim.src.reads, sim.cues.len());
     sim.scroll_to(1600, 100, 4);
     assert_eq!(sim.segments.len(), 2, "nothing emitted after an explicit pause");
     assert_eq!(sim.src.reads, reads, "nothing read after an explicit pause");
+    assert_eq!(sim.cues.len(), cues, "no guidance after an explicit pause");
 }
 
 #[wasm_bindgen_test]
@@ -233,7 +308,7 @@ fn scan_returns_to_the_previous_state() {
     // From PAUSED: back to PAUSED.
     sim.state.start_scan(1);
     assert!(sim.state.is_viewing() && sim.state.is_scanning());
-    sim.scroll_to(0, 100, 2);
+    sim.scroll_to(0, 100, 16);
     let summary = sim.state.end_scan().unwrap();
     assert_eq!((summary.scan_id, summary.segments), (1, 1));
     assert_eq!(sim.state.mode(), Mode::Paused);
@@ -253,8 +328,8 @@ fn scan_stops_at_the_segment_cap() {
     let page = Page::new(3);
     let settings = CaptureSettings { max_scan_segments: 3, ..CaptureSettings::default() };
     let mut sim = Sim::new(&page, settings);
-    sim.state.start_scan(1);
-    for stop in [0, 600, 1200, 1800, 2400] {
+    sim.start_at_top(1);
+    for stop in [600, 1200, 1800, 2400] {
         sim.scroll_to(stop, 100, 2);
     }
     assert_eq!(sim.segments.len(), 3);

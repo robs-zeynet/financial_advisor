@@ -171,8 +171,25 @@ struct Spoken {
     start_s: f64,
 }
 
+/// What an utterance is: a reply (part of the conversation) or guidance
+/// (scan cues, never part of it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UtteranceKind {
+    Reply,
+    Guidance,
+}
+
+/// What `Speaker::stop` interrupted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stopped {
+    /// Audio was playing or queued.
+    pub active: bool,
+    pub kind: UtteranceKind,
+}
+
 struct Utterance {
     id: u32,
+    kind: UtteranceKind,
     cancel: CancellationToken,
     base: Instant,
     /// Sentences sent to the browser, with their estimated playback start.
@@ -225,8 +242,18 @@ impl Speaker {
         Self { tts, out, current: Arc::new(Mutex::new(None)), next_id: Mutex::new(0) }
     }
 
-    /// Starts a new utterance (stopping any previous one).
+    /// Speaks a short guidance line right away, replacing anything playing.
+    pub fn announce(&self, text: &str) {
+        let handle = self.begin_kind(UtteranceKind::Guidance);
+        handle.say(text.to_string(), text.len());
+    }
+
+    /// Starts a new reply utterance (stopping any previous one).
     pub fn begin(&self) -> UtteranceHandle {
+        self.begin_kind(UtteranceKind::Reply)
+    }
+
+    fn begin_kind(&self, kind: UtteranceKind) -> UtteranceHandle {
         self.stop();
         let id = {
             let mut n = self.next_id.lock().unwrap();
@@ -236,6 +263,7 @@ impl Speaker {
         let cancel = CancellationToken::new();
         *self.current.lock().unwrap() = Some(Utterance {
             id,
+            kind,
             cancel: cancel.clone(),
             base: Instant::now(),
             timeline: Vec::new(),
@@ -285,26 +313,32 @@ impl Speaker {
         })
     }
 
-    /// Byte length of the current turn's text the user has heard (at least
+    /// Byte length of the current reply's text the user has heard (at least
     /// begun hearing). After `stop`, the value at the moment it stopped.
+    /// `None` when no reply is current (e.g. a scan cue is).
     pub fn heard_prefix(&self) -> Option<usize> {
-        self.current.lock().unwrap().as_ref().map(|u| u.frozen_prefix.unwrap_or_else(|| u.heard_prefix()))
+        self.current
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|u| u.kind == UtteranceKind::Reply)
+            .map(|u| u.frozen_prefix.unwrap_or_else(|| u.heard_prefix()))
     }
 
-    /// Stops playback now. Returns whether anything was playing or queued.
-    pub fn stop(&self) -> bool {
+    /// Stops playback now and says what was interrupted.
+    pub fn stop(&self) -> Stopped {
         let mut guard = self.current.lock().unwrap();
-        let Some(u) = guard.as_mut() else { return false };
+        let Some(u) = guard.as_mut() else { return Stopped { active: false, kind: UtteranceKind::Reply } };
         if u.frozen_prefix.is_some() {
-            return false;
+            return Stopped { active: false, kind: u.kind };
         }
         let active = u.pending > 0 || u.now_s() < u.playing_until;
         u.frozen_prefix = Some(u.heard_prefix());
         u.cancel.cancel();
-        let id = u.id;
+        let (id, kind) = (u.id, u.kind);
         drop(guard);
         let _ = self.out.send(Outbound::Msg(ServerMsg::StopAudio { utterance_id: id }));
-        active
+        Stopped { active, kind }
     }
 }
 

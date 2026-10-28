@@ -195,3 +195,38 @@ async fn push_to_talk_and_mic_off() {
     assert_eq!(heard.len(), 1, "the ignored audio never reached STT");
     assert!(heard[0] >= 1500 * 16, "the whole held span was transcribed");
 }
+
+/// Page-scan guidance is spoken in the advisor's voice but never enters the
+/// conversation; talking over it isn't treated as interrupting a reply.
+#[tokio::test]
+async fn scan_cues_are_spoken_not_sent_to_claude() {
+    use protocol::ScanCue;
+    let dir = tempfile::tempdir().unwrap();
+    let mock = spawn_mock_claude(vec![MockReply::Sse("text.sse")]).await;
+    let stt = FakeStt::new(&["Okay, what did you see?"]);
+    let tts = FakeTts::new(3.0);
+    let (addr, _) = spawn_app_with_voice(test_config(dir.path(), &mock.base_url), voice(&stt, &tts)).await;
+    let mut c = FakeClient::connect(addr).await;
+    c.start_call().await;
+
+    c.start_scan(1).await;
+    for cue in [ScanCue::Begin, ScanCue::Stop, ScanCue::TooFar] {
+        c.send(ClientMsg::ScanCue { cue }).await;
+    }
+    // Each new cue replaces the one playing.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        tts.spoken.lock().unwrap().as_slice(),
+        [ScanCue::Begin.phrase(), ScanCue::Stop.phrase(), ScanCue::TooFar.phrase()]
+    );
+    // Talk over the cue, then ask something.
+    say(&mut c, 700).await;
+    let seen = c.recv_until(done).await;
+    assert!(seen.iter().any(|m| matches!(m, ServerMsg::StopAudio { .. })), "the cue was cut off");
+
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 1);
+    let body = reqs[0].body.to_string();
+    assert!(!body.contains("skipped a bit") && !body.contains("stop there"), "cues never reach Claude");
+    assert!(!body.contains("interrupted"), "talking over a cue isn't interrupting a reply");
+}
