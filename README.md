@@ -4,10 +4,10 @@ A local-first, single-user web app: you "call" a Claude-powered financial
 analyst from your browser and, when you choose, let it see one shared window or
 tab. See `PROMPT.md` for the full spec and privacy invariants.
 
-**Status: M0 (skeleton).** Typed chat with Claude, `view_screen` with the
-capture loop, and pause/resume (P2). Next: page scans for long pages (M1),
-screen notes (M2), voice (M3), records (M4), memory approval (M5), and polish
-plus the full privacy write-up (M6).
+**Status: M1 (page scans).** Typed chat with Claude, `view_screen` with the
+capture loop, pause/resume (P2), and page scans for pages longer than one
+screen. Next: screen notes (M2), voice (M3), records (M4), memory
+approval (M5), and polish plus the full privacy write-up (M6).
 
 ## Run
 
@@ -23,6 +23,19 @@ export ANTHROPIC_API_KEY=...
 Open http://127.0.0.1:8765, click **Start call**, then **Share a window or
 tab…** (pick a single tab or window). Viewing stays ⚪ PAUSED until you click
 **Resume viewing** or press Ctrl+Shift+V.
+
+### Long pages
+
+Scroll the shared page to the top, click **Scan page** (or Ctrl+Shift+S, or
+type "scan this page"), then switch to the shared page and scroll slowly to
+the bottom, pausing briefly at each screenful. Come back to the app (or click
+**Done**, or type "done") to finish. The advisor is told a scan is available
+and looks at it with `view_screen` (scope `scan`). A scan started while paused
+returns to paused when it ends.
+
+Browsers slow timers in background tabs, so if the app and the shared page
+are tabs in the same window, scans sample about once a second instead of four
+times. Keeping the app in its own window avoids that.
 
 ## Test
 

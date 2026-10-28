@@ -1,5 +1,5 @@
-//! Screen capture: `getDisplayMedia`, canvas sampling, dHash change detection,
-//! JPEG encoding.
+//! Screen capture: `getDisplayMedia`, canvas sampling, dHash change and settle
+//! detection, page-scan segments, JPEG encoding.
 //!
 //! P2 is enforced here, in the client: while PAUSED the loop returns before
 //! touching the video, so no frame is drawn, hashed, encoded, or sent. Every
@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use protocol::{CaptureSettings, FrameHeader};
+use protocol::{CaptureSettings, FrameHeader, MAX_SCAN_SEGMENTS_CAP};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -18,27 +18,40 @@ use web_sys::{
 };
 
 use crate::dom;
+use crate::scan::{rows_to_px, ScanProgress, ScanSummary, SegmentInfo};
 use crate::ws::Ws;
 
 // ------------------------------------------------------------ pure logic
 
-/// Thumbnail size for dHash: 65 columns give 64 horizontal gradients per row.
+/// Grayscale thumbnail taken every sample: 65 columns (64 horizontal
+/// gradients for dHash) by 256 rows (enough vertical detail to estimate
+/// scroll offsets during a scan).
 pub const THUMB_W: u32 = 65;
-pub const THUMB_H: u32 = 64;
+pub const THUMB_H: u32 = 256;
+/// Thumbnail rows averaged into one dHash row (256 / 4 = 64 rows).
+const DHASH_ROW_GROUP: usize = 4;
+const DHASH_ROWS: usize = THUMB_H as usize / DHASH_ROW_GROUP;
 
-/// 64x64-bit difference hash of a grayscale `THUMB_W` x `THUMB_H` thumbnail.
+/// 64x64-bit difference hash of a thumbnail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DHash(pub [u64; THUMB_H as usize]);
+pub struct DHash(pub [u64; DHASH_ROWS]);
 
 impl DHash {
-    pub fn of_gray(gray: &[u8]) -> Self {
+    /// Hashes a `THUMB_W` x `THUMB_H` grayscale thumbnail.
+    pub fn of_thumb(gray: &[u8]) -> Self {
         assert_eq!(gray.len(), (THUMB_W * THUMB_H) as usize, "thumbnail size");
-        let mut rows = [0u64; THUMB_H as usize];
-        for (y, row) in rows.iter_mut().enumerate() {
-            let base = y * THUMB_W as usize;
+        let w = THUMB_W as usize;
+        let mut rows = [0u64; DHASH_ROWS];
+        for (hy, bits) in rows.iter_mut().enumerate() {
+            let mut avg = [0u32; THUMB_W as usize];
+            for y in hy * DHASH_ROW_GROUP..(hy + 1) * DHASH_ROW_GROUP {
+                for (x, a) in avg.iter_mut().enumerate() {
+                    *a += gray[y * w + x] as u32;
+                }
+            }
             for x in 0..64 {
-                if gray[base + x] < gray[base + x + 1] {
-                    *row |= 1 << x;
+                if avg[x] < avg[x + 1] {
+                    *bits |= 1 << x;
                 }
             }
         }
@@ -57,34 +70,70 @@ pub fn rgba_to_gray(rgba: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// Where the capture loop gets its 65x64 grayscale thumbnail. Only called
-/// while VIEWING.
+/// Where the capture loop gets its grayscale thumbnail. Only called while
+/// VIEWING or SCANNING.
 pub trait ThumbSource {
     fn thumbnail(&mut self) -> Option<Vec<u8>>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Paused,
+    Viewing,
+    /// A page scan; `resume_viewing` is the state to return to afterwards.
+    Scanning { scan_id: u32, resume_viewing: bool },
+}
+
+/// What the loop should encode and send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendFrame {
+    pub changed: bool,
+    /// Set for page-scan segments.
+    pub scan: Option<SegmentInfo>,
 }
 
 /// The capture state machine. Starts PAUSED.
 #[derive(Debug)]
 pub struct CaptureState {
-    viewing: bool,
+    mode: Mode,
     settings: CaptureSettings,
-    last_hash: Option<DHash>,
+    last_sample_ms: Option<f64>,
+    /// Hash of the previous sample, for settle detection.
+    prev_sample: Option<DHash>,
+    /// Hash of the last live frame sent, for change detection.
+    last_sent: Option<DHash>,
     last_sent_ms: f64,
-}
-
-/// A frame the loop should encode and send.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SendFrame {
-    pub changed: bool,
+    scan: Option<ScanProgress>,
 }
 
 impl CaptureState {
     pub fn new(settings: CaptureSettings) -> Self {
-        Self { viewing: false, settings, last_hash: None, last_sent_ms: 0.0 }
+        Self {
+            mode: Mode::Paused,
+            settings,
+            last_sample_ms: None,
+            prev_sample: None,
+            last_sent: None,
+            last_sent_ms: 0.0,
+            scan: None,
+        }
     }
 
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// True while frames may be captured (VIEWING or SCANNING).
     pub fn is_viewing(&self) -> bool {
-        self.viewing
+        self.mode != Mode::Paused
+    }
+
+    pub fn is_scanning(&self) -> bool {
+        matches!(self.mode, Mode::Scanning { .. })
+    }
+
+    pub fn scan_progress(&self) -> Option<&ScanProgress> {
+        self.scan.as_ref()
     }
 
     pub fn settings(&self) -> CaptureSettings {
@@ -95,38 +144,113 @@ impl CaptureState {
         self.settings = settings;
     }
 
+    fn reset_sampling(&mut self) {
+        self.last_sample_ms = None;
+        self.prev_sample = None;
+        self.last_sent = None;
+    }
+
+    /// Resume live viewing. Ignored during a scan.
     pub fn resume(&mut self) {
-        self.viewing = true;
-        // The first frame after resuming is always sent as changed.
-        self.last_hash = None;
-    }
-
-    pub fn pause(&mut self) {
-        self.viewing = false;
-        self.last_hash = None;
-    }
-
-    /// One sampling tick. While PAUSED this returns `None` without calling
-    /// the source at all.
-    pub fn tick(&mut self, now_ms: f64, source: &mut impl ThumbSource) -> Option<SendFrame> {
-        if !self.viewing {
-            return None;
+        if self.mode == Mode::Paused {
+            self.mode = Mode::Viewing;
+            self.reset_sampling();
         }
-        let gray = source.thumbnail()?;
-        let hash = DHash::of_gray(&gray);
-        let changed = match &self.last_hash {
-            None => true,
-            Some(prev) => prev.distance(&hash) >= self.settings.change_threshold_bits,
+    }
+
+    /// Explicit pause: stops everything and cancels any scan.
+    pub fn pause(&mut self) -> Option<ScanSummary> {
+        self.mode = Mode::Paused;
+        self.reset_sampling();
+        self.scan.take().map(|s| s.summary())
+    }
+
+    /// Starts a page scan (an explicit, bounded period of viewing).
+    pub fn start_scan(&mut self, scan_id: u32) {
+        let resume_viewing = match self.mode {
+            Mode::Paused => false,
+            Mode::Viewing => true,
+            Mode::Scanning { resume_viewing, .. } => resume_viewing,
         };
-        let keepalive_due = now_ms - self.last_sent_ms >= self.settings.keepalive_ms as f64;
-        if !changed && !keepalive_due {
+        self.mode = Mode::Scanning { scan_id, resume_viewing };
+        self.scan = Some(ScanProgress::new(scan_id));
+        self.reset_sampling();
+    }
+
+    /// Finishes the scan and returns to the pre-scan state.
+    pub fn end_scan(&mut self) -> Option<ScanSummary> {
+        let Mode::Scanning { resume_viewing, .. } = self.mode else { return None };
+        self.mode = if resume_viewing { Mode::Viewing } else { Mode::Paused };
+        self.reset_sampling();
+        self.scan.take().map(|s| s.summary())
+    }
+
+    fn max_segments(&self) -> u32 {
+        self.settings.max_scan_segments.clamp(1, MAX_SCAN_SEGMENTS_CAP)
+    }
+
+    /// The scan has reached its segment cap and should be ended.
+    pub fn scan_full(&self) -> bool {
+        self.scan.as_ref().is_some_and(|s| s.segments >= self.max_segments())
+    }
+
+    /// Whether a frame decided earlier may still be sent now (it may have
+    /// been encoding while the user paused or ended the scan).
+    pub fn accepts(&self, header: &FrameHeader) -> bool {
+        match self.mode {
+            Mode::Paused => false,
+            Mode::Viewing => !header.is_scan_segment(),
+            Mode::Scanning { scan_id, .. } => header.scan_id == scan_id,
+        }
+    }
+
+    /// One timer tick. While PAUSED this returns `None` without calling the
+    /// source at all. Otherwise it samples at the mode's interval and decides
+    /// whether to send a frame.
+    pub fn tick(&mut self, now_ms: f64, source: &mut impl ThumbSource) -> Option<SendFrame> {
+        if self.mode == Mode::Paused {
             return None;
         }
-        if changed {
-            self.last_hash = Some(hash);
+        let interval = match self.mode {
+            Mode::Scanning { .. } => self.settings.scan_sample_interval_ms,
+            _ => self.settings.sample_interval_ms,
+        } as f64;
+        if self.last_sample_ms.is_some_and(|t| now_ms - t < interval - 1.0) {
+            return None;
         }
-        self.last_sent_ms = now_ms;
-        Some(SendFrame { changed })
+        if self.scan_full() {
+            return None;
+        }
+        let thumb = source.thumbnail()?;
+        self.last_sample_ms = Some(now_ms);
+        let hash = DHash::of_thumb(&thumb);
+        let threshold = self.settings.change_threshold_bits;
+        // Settled: the screen didn't change since the previous sample.
+        let settled = self.prev_sample.is_some_and(|p| p.distance(&hash) < threshold);
+        self.prev_sample = Some(hash);
+
+        if let Some(scan) = self.scan.as_mut() {
+            scan.note_sample(now_ms);
+            if !settled {
+                return None;
+            }
+            return scan.consider(hash, &thumb, threshold).map(|info| SendFrame { changed: true, scan: Some(info) });
+        }
+
+        let changed = self.last_sent.is_none_or(|l| l.distance(&hash) >= threshold);
+        if changed {
+            if !settled {
+                return None; // mid-scroll or mid-animation: wait for it to settle
+            }
+            self.last_sent = Some(hash);
+            self.last_sent_ms = now_ms;
+            return Some(SendFrame { changed: true, scan: None });
+        }
+        if now_ms - self.last_sent_ms >= self.settings.keepalive_ms as f64 {
+            self.last_sent_ms = now_ms;
+            return Some(SendFrame { changed: false, scan: None });
+        }
+        None
     }
 }
 
@@ -142,7 +266,18 @@ pub fn scaled_size(w: u32, h: u32, max_long_edge: u32) -> (u32, u32) {
 
 // ------------------------------------------------------------ browser side
 
-type Callback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+/// Things the capture loop reports back to the view.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CaptureEvent {
+    /// The user stopped sharing from the browser's own UI.
+    ShareEnded,
+    /// A scan segment was captured.
+    Segment { segments: u32, gap_before: bool },
+    /// The scan reached its segment cap.
+    ScanFull,
+}
+
+type EventSink = Rc<RefCell<Option<Box<dyn Fn(CaptureEvent)>>>>;
 
 /// Owns the shared stream, the hidden video element, and the canvases.
 pub struct Capturer {
@@ -153,8 +288,7 @@ pub struct Capturer {
     thumb: HtmlCanvasElement,
     encoding: Rc<RefCell<bool>>,
     ws: Ws,
-    /// Called when sharing ends from the browser's own "Stop sharing" UI.
-    on_share_ended: Callback,
+    on_event: EventSink,
 }
 
 struct VideoThumb<'a> {
@@ -201,18 +335,32 @@ impl Capturer {
             thumb,
             encoding: Rc::new(RefCell::new(false)),
             ws,
-            on_share_ended: Rc::new(RefCell::new(None)),
+            on_event: Rc::new(RefCell::new(None)),
         });
         me.clone().start_loop();
         me
     }
 
-    pub fn set_on_share_ended(&self, f: impl Fn() + 'static) {
-        *self.on_share_ended.borrow_mut() = Some(Box::new(f));
+    pub fn set_on_event(&self, f: impl Fn(CaptureEvent) + 'static) {
+        *self.on_event.borrow_mut() = Some(Box::new(f));
+    }
+
+    fn emit(&self, e: CaptureEvent) {
+        if let Some(f) = self.on_event.borrow().as_ref() {
+            f(e);
+        }
     }
 
     pub fn is_viewing(&self) -> bool {
         self.state.borrow().is_viewing()
+    }
+
+    pub fn is_scanning(&self) -> bool {
+        self.state.borrow().is_scanning()
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.state.borrow().mode()
     }
 
     pub fn has_stream(&self) -> bool {
@@ -223,10 +371,24 @@ impl Capturer {
         self.state.borrow_mut().resume();
     }
 
-    /// Pauses immediately and clears any pixels left on the canvases.
-    pub fn pause(&self) {
-        self.state.borrow_mut().pause();
+    /// Pauses immediately (cancelling any scan) and clears any pixels left on
+    /// the canvases.
+    pub fn pause(&self) -> Option<ScanSummary> {
+        let cancelled = self.state.borrow_mut().pause();
         self.clear_canvases();
+        cancelled
+    }
+
+    pub fn start_scan(&self, scan_id: u32) {
+        self.state.borrow_mut().start_scan(scan_id);
+    }
+
+    pub fn end_scan(&self) -> Option<ScanSummary> {
+        let summary = self.state.borrow_mut().end_scan();
+        if !self.is_viewing() {
+            self.clear_canvases();
+        }
+        summary
     }
 
     fn clear_canvases(&self) {
@@ -255,9 +417,7 @@ impl Capturer {
                 me.pause();
                 me.stream.borrow_mut().take();
                 me.video.set_src_object(None);
-                if let Some(f) = me.on_share_ended.borrow().as_ref() {
-                    f();
-                }
+                me.emit(CaptureEvent::ShareEnded);
             });
         }
         self.video.set_src_object(Some(&stream));
@@ -277,10 +437,13 @@ impl Capturer {
         self.video.set_src_object(None);
     }
 
+    /// One fast base timer; `CaptureState::tick` decides when to actually
+    /// sample for the current mode.
     fn start_loop(self: Rc<Self>) {
-        let interval_ms = self.state.borrow().settings().sample_interval_ms;
+        let d = CaptureSettings::default();
+        let base_ms = d.scan_sample_interval_ms.min(d.sample_interval_ms);
         let me = self.clone();
-        let interval = gloo_timers::callback::Interval::new(interval_ms, move || me.tick());
+        let interval = gloo_timers::callback::Interval::new(base_ms, move || me.tick());
         interval.forget();
     }
 
@@ -294,6 +457,21 @@ impl Capturer {
         let Some(send) = self.state.borrow_mut().tick(now, &mut src) else { return };
         let settings = self.state.borrow().settings();
         let (w, h) = scaled_size(self.video.video_width(), self.video.video_height(), settings.max_long_edge);
+        let mut header = FrameHeader::live(now as u64, w as u16, h as u16, send.changed);
+        if let Some(seg) = send.scan {
+            header.scan_id = seg.scan_id;
+            header.segment_index = seg.segment_index;
+            header.offset_px = seg.offset_rows.map(|r| rows_to_px(r, h));
+            header.gap_before = seg.gap_before;
+            self.emit(CaptureEvent::Segment { segments: seg.segment_index as u32 + 1, gap_before: seg.gap_before });
+        }
+        self.encode_and_send(header, w, h, settings.jpeg_quality);
+        if send.scan.is_some() && self.state.borrow().scan_full() {
+            self.emit(CaptureEvent::ScanFull);
+        }
+    }
+
+    fn encode_and_send(self: &Rc<Self>, header: FrameHeader, w: u32, h: u32, quality: f64) {
         self.canvas.set_width(w);
         self.canvas.set_height(h);
         let Some(ctx) = ctx2d(&self.canvas) else { return };
@@ -302,7 +480,6 @@ impl Capturer {
         }
         *self.encoding.borrow_mut() = true;
         let me = self.clone();
-        let header = FrameHeader { captured_at_ms: now as u64, width: w as u16, height: h as u16, changed: send.changed };
         let cb = Closure::once(move |blob: JsValue| {
             me.clear_canvases();
             let me2 = me.clone();
@@ -313,11 +490,7 @@ impl Capturer {
         });
         if self
             .canvas
-            .to_blob_with_type_and_encoder_options(
-                cb.as_ref().unchecked_ref(),
-                "image/jpeg",
-                &JsValue::from_f64(settings.jpeg_quality),
-            )
+            .to_blob_with_type_and_encoder_options(cb.as_ref().unchecked_ref(), "image/jpeg", &JsValue::from_f64(quality))
             .is_err()
         {
             *self.encoding.borrow_mut() = false;
@@ -327,12 +500,12 @@ impl Capturer {
     }
 
     async fn finish_frame(&self, blob: JsValue, header: FrameHeader) {
-        if !self.is_viewing() {
-            return; // paused while encoding: drop
+        if !self.state.borrow().accepts(&header) {
+            return; // paused, or the scan ended, while encoding: drop
         }
         let Ok(blob) = blob.dyn_into::<Blob>() else { return };
         let Ok(buf) = JsFuture::from(blob.array_buffer()).await else { return };
-        if !self.is_viewing() {
+        if !self.state.borrow().accepts(&header) {
             return;
         }
         let jpeg = js_sys::Uint8Array::new(&buf).to_vec();
@@ -355,8 +528,8 @@ mod tests {
     fn dhash_distance() {
         let flat = vec![128u8; (THUMB_W * THUMB_H) as usize];
         let ramp: Vec<u8> = (0..THUMB_W * THUMB_H).map(|i| (i % THUMB_W) as u8).collect();
-        let a = DHash::of_gray(&flat);
-        let b = DHash::of_gray(&ramp);
+        let a = DHash::of_thumb(&flat);
+        let b = DHash::of_thumb(&ramp);
         assert_eq!(a.distance(&a), 0);
         assert_eq!(a.distance(&b), 64 * 64);
     }

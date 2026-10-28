@@ -2,6 +2,7 @@
 
 pub mod capture;
 pub mod dom;
+pub mod scan;
 pub mod views;
 pub mod ws;
 

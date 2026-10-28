@@ -121,8 +121,30 @@ impl FakeClient {
     }
 
     pub async fn send_frame(&mut self, t: u64, jpeg: &[u8]) {
-        let bytes = FrameHeader { captured_at_ms: t, width: 640, height: 400, changed: true }.encode(jpeg);
+        self.send_header(FrameHeader::live(t, 640, 400, true), jpeg).await;
+    }
+
+    pub async fn send_header(&mut self, header: FrameHeader, jpeg: &[u8]) {
+        let bytes = header.encode(jpeg);
         self.socket.send(WsMessage::Binary(bytes.into())).await.unwrap();
+    }
+
+    /// Sends one page-scan segment.
+    pub async fn send_segment(&mut self, scan_id: u32, index: u16, offset_px: Option<i32>, gap_before: bool, jpeg: &[u8]) {
+        let header = FrameHeader {
+            scan_id,
+            segment_index: index,
+            offset_px,
+            gap_before,
+            ..FrameHeader::live(1_000 + index as u64, 1600, 900, true)
+        };
+        self.send_header(header, jpeg).await;
+    }
+
+    /// Starts a scan and checks the server acknowledged it.
+    pub async fn start_scan(&mut self, scan_id: u32) {
+        self.send(ClientMsg::StartScan { scan_id }).await;
+        assert_eq!(self.recv().await, ServerMsg::ScanState { active: true, scan_id, segments: 0, gaps: 0 });
     }
 
     pub async fn recv(&mut self) -> ServerMsg {

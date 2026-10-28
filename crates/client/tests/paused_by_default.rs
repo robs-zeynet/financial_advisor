@@ -3,7 +3,7 @@
 //!
 //! Run headless with: `wasm-pack test --headless --chrome crates/client`
 
-use client::capture::{CaptureState, SendFrame, ThumbSource, THUMB_H, THUMB_W};
+use client::capture::{CaptureState, Mode, SendFrame, ThumbSource, THUMB_H, THUMB_W};
 use protocol::CaptureSettings;
 use wasm_bindgen_test::*;
 
@@ -28,13 +28,17 @@ impl ThumbSource for CountingSource {
     }
 }
 
+const LIVE: Option<SendFrame> = Some(SendFrame { changed: true, scan: None });
+const KEEPALIVE: Option<SendFrame> = Some(SendFrame { changed: false, scan: None });
+
 #[wasm_bindgen_test]
 fn starts_paused_and_emits_nothing() {
     let mut state = CaptureState::new(CaptureSettings::default());
     let mut src = CountingSource::new();
     assert!(!state.is_viewing(), "capture must start PAUSED");
+    assert_eq!(state.mode(), Mode::Paused);
     for i in 0..100 {
-        assert_eq!(state.tick(i as f64 * 1000.0, &mut src), None);
+        assert_eq!(state.tick(i as f64 * 250.0, &mut src), None);
     }
     assert_eq!(src.reads, 0, "a paused capture loop must not read the screen");
 }
@@ -46,14 +50,18 @@ fn emits_only_after_resume_and_stops_on_pause() {
     let mut src = CountingSource::new();
 
     state.resume();
-    assert_eq!(state.tick(1_000.0, &mut src), Some(SendFrame { changed: true }));
+    // The first sample can't be known to be settled yet; the second can.
+    assert_eq!(state.tick(1_000.0, &mut src), None);
+    assert_eq!(state.tick(1_250.0, &mut src), None, "samples at the live interval, not faster");
+    assert_eq!(state.tick(2_000.0, &mut src), LIVE);
     // Unchanged screen: nothing until the keepalive is due.
-    assert_eq!(state.tick(2_000.0, &mut src), None);
-    let keepalive_at = 1_000.0 + settings.keepalive_ms as f64;
-    assert_eq!(state.tick(keepalive_at, &mut src), Some(SendFrame { changed: false }));
-    // A changed screen goes out right away.
+    assert_eq!(state.tick(3_000.0, &mut src), None);
+    let keepalive_at = 2_000.0 + settings.keepalive_ms as f64;
+    assert_eq!(state.tick(keepalive_at, &mut src), KEEPALIVE);
+    // A changed screen goes out once it has settled.
     src.gray = (0..THUMB_W * THUMB_H).map(|i| ((i * 37) % 251) as u8).collect();
-    assert_eq!(state.tick(keepalive_at + 1_000.0, &mut src), Some(SendFrame { changed: true }));
+    assert_eq!(state.tick(keepalive_at + 1_000.0, &mut src), None, "not settled yet");
+    assert_eq!(state.tick(keepalive_at + 2_000.0, &mut src), LIVE);
 
     let reads_before_pause = src.reads;
     state.pause();
@@ -62,9 +70,9 @@ fn emits_only_after_resume_and_stops_on_pause() {
     }
     assert_eq!(src.reads, reads_before_pause, "no reads after pause");
 
-    // After resuming, the first frame is sent as changed.
     state.resume();
-    assert_eq!(state.tick(200_000.0, &mut src), Some(SendFrame { changed: true }));
+    assert_eq!(state.tick(200_000.0, &mut src), None);
+    assert_eq!(state.tick(201_000.0, &mut src), LIVE, "first frame after resume is sent as changed");
 }
 
 #[wasm_bindgen_test]

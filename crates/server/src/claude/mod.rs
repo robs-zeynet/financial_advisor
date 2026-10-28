@@ -55,16 +55,24 @@ pub fn system_blocks(system_prompt: &str, memory: &str) -> Vec<SystemBlock> {
 pub fn view_screen_tool() -> Value {
     json!({
         "name": VIEW_SCREEN,
-        "description": "Look at the user's shared browser window or tab. Returns the most recent \
-screen frame plus up to three earlier distinct frames captured since your last look, each \
-labeled with when it was captured. If the user has paused viewing, returns a note saying so \
-instead. Use it whenever the answer depends on what is on their screen.",
+        "description": "Look at the user's shared browser window or tab. With scope \"current\" \
+(the default) it returns the most recent screen frame plus up to three earlier distinct frames \
+captured since your last look, each labeled with when it was captured. With scope \"scan\" it \
+returns the user's most recent page scan: every segment of a long page, top to bottom, labeled \
+with its approximate position, with any possible gaps called out. If the user has paused \
+viewing, \"current\" returns a note saying so instead. Use it whenever the answer depends on \
+what is on their screen.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "reason": {
                     "type": "string",
                     "description": "Briefly, what you want to look at and why."
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["current", "scan"],
+                    "description": "\"current\" for what is on screen now; \"scan\" for the most recent page scan."
                 }
             },
             "required": ["reason"],
@@ -95,6 +103,7 @@ pub fn context_management(cfg: &ClaudeConfig) -> Value {
             "type": "clear_tool_uses_20250919",
             "trigger": {"type": "input_tokens", "value": cfg.clear_trigger_tokens},
             "keep": {"type": "tool_uses", "value": cfg.keep_screen_views},
+            "clear_at_least": {"type": "input_tokens", "value": cfg.clear_at_least_tokens},
             "exclude_tools": ["web_search"]
         }]
     })
@@ -196,6 +205,9 @@ impl ClaudeClient {
             output_config: OutputConfig { effort },
             fallbacks: Some("default"),
             context_management: Some(context_management(&self.cfg)),
+            // Moving breakpoint at the end of the conversation, so big tool
+            // results (page scans) are read from cache on later requests.
+            cache_control: Some(types::CacheControl::ephemeral()),
         }
     }
 
@@ -372,7 +384,8 @@ pub trait ToolHost: Sync {
         Vec::new()
     }
 
-    fn view_screen(&self, reason: &str) -> impl Future<Output = ToolOutput> + Send;
+    /// `input` is the tool call's validated input (`reason`, optional `scope`).
+    fn view_screen(&self, input: &Value) -> impl Future<Output = ToolOutput> + Send;
 }
 
 /// Progress of a turn, for the UI.
@@ -461,8 +474,7 @@ pub async fn run_turn(
                 let mut results = Vec::new();
                 for (id, name, input) in tool_calls {
                     let out = if name == VIEW_SCREEN {
-                        let reason = input.get("reason").and_then(Value::as_str).unwrap_or("");
-                        host.view_screen(reason).await
+                        host.view_screen(&input).await
                     } else {
                         ToolOutput {
                             content: vec![ContentBlock::text(format!("Unknown tool: {name}"))],

@@ -129,6 +129,17 @@ async fn connection(app: Arc<AppState>, socket: WebSocket) {
                             let _ = out_tx.send(ServerMsg::ViewingState { viewing: false });
                         }
                     },
+                    ClientMsg::StartScan { scan_id } => match session.as_mut() {
+                        Some(s) => s.start_scan(scan_id),
+                        None => {
+                            let _ = out_tx.send(ServerMsg::ScanState { active: false, scan_id, segments: 0, gaps: 0 });
+                        }
+                    },
+                    ClientMsg::EndScan { scan_id } => {
+                        if let Some(s) = session.as_mut() {
+                            s.end_scan(scan_id);
+                        }
+                    }
                     ClientMsg::UserText { text } => match session.as_mut() {
                         Some(s) => s.user_text(text),
                         None => {

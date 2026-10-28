@@ -154,6 +154,16 @@ async fn scripted_session_leaves_no_frames_on_disk() {
         jpeg.extend_from_slice(&t.to_be_bytes());
         c.send_frame(t, &jpeg).await;
     }
+    // ...and a page scan, whose segments also stay in RAM only.
+    c.start_scan(1).await;
+    for i in 0..4u16 {
+        let mut jpeg = b"\xFF\xD8\xFF\xE0\x00\x10JFIF-segment".to_vec();
+        jpeg.extend_from_slice(&i.to_be_bytes());
+        c.send_segment(1, i, (i > 0).then_some(600), false, &jpeg).await;
+        assert!(matches!(c.recv().await, ServerMsg::ScanState { segments, .. } if segments == u32::from(i) + 1));
+    }
+    c.send(ClientMsg::EndScan { scan_id: 1 }).await;
+    assert!(matches!(c.recv().await, ServerMsg::ScanState { active: false, segments: 4, .. }));
     c.send(ClientMsg::UserText { text: "look at my holdings".into() }).await;
     let seen = c.recv_until(done).await;
     assert!(seen.iter().any(|m| matches!(m, ServerMsg::ToolActivity { detail, .. } if detail.contains("frames"))));

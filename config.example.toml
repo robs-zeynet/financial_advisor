@@ -11,16 +11,19 @@ api_version = "2026-10-21"
 max_tokens = 16000
 effort = "low"          # conversation turns
 deep_effort = "high"    # deep review and the session summary
-keep_screen_views = 2   # view_screen results kept in context (context editing)
-clear_trigger_tokens = 30000
+keep_screen_views = 2   # view_screen results kept in context (a page scan counts as one)
+clear_trigger_tokens = 60000
+clear_at_least_tokens = 15000   # clear old screen views only in large batches
 max_retries = 4
 
 [capture]
-sample_interval_ms = 1000
-max_long_edge = 2000    # px; see README for why not 1568
+sample_interval_ms = 1000       # while VIEWING
+scan_sample_interval_ms = 250   # while SCANNING
+max_long_edge = 2000    # px, at most 2000; see README for why not 1568
 jpeg_quality = 0.8
 keepalive_ms = 10000
 change_threshold_bits = 8   # of 4096 dHash bits
+max_scan_segments = 12      # a scan ends automatically here; at most 20
 
 [web_search]
 enabled = false   # off by default; when on, the prompt forbids personal data in queries

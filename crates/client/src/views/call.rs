@@ -1,26 +1,39 @@
-//! The call screen: start/end, viewing toggle with the big state indicator,
-//! the live transcript, and typed input (M0).
+//! The call screen: start/end, viewing toggle and page scans with the big
+//! state indicator, the live transcript, and typed input.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use protocol::{is_pause_command, ClientMsg, ServerMsg, VIEWING_HOTKEY_KEY};
+use protocol::{
+    is_pause_command, is_scan_command, is_scan_done_command, ClientMsg, ServerMsg, SCAN_HOTKEY_KEY,
+    VIEWING_HOTKEY_KEY,
+};
 use wasm_bindgen::JsCast;
 use web_sys::{Element, HtmlTextAreaElement, KeyboardEvent};
 
-use crate::capture::Capturer;
+use crate::capture::{CaptureEvent, Capturer, Mode};
 use crate::dom::{self, append, el, el_text, on, set_class, set_disabled, set_text};
+use crate::scan::ScanSummary;
 use crate::ws::Ws;
+
+/// Below this sampling rate a scan was probably throttled in a background tab.
+const SLOW_SCAN_SAMPLES_PER_SEC: f64 = 2.0;
 
 pub struct CallView {
     ws: RefCell<Option<Ws>>,
     capture: RefCell<Option<Rc<Capturer>>>,
-    in_call: RefCell<bool>,
+    in_call: Cell<bool>,
+    next_scan_id: Cell<u32>,
+    /// Segments captured in the scan in progress.
+    scan_segments: Cell<u32>,
+    /// The app lost focus or visibility during the scan; regaining it ends the scan.
+    scan_left_app: Cell<bool>,
     indicator: Element,
     start_btn: Element,
     end_btn: Element,
     share_btn: Element,
     view_btn: Element,
+    scan_btn: Element,
     transcript: Element,
     input: HtmlTextAreaElement,
     send_btn: Element,
@@ -42,15 +55,30 @@ impl CallView {
         let end_btn = el_text("button", "danger", "End call");
         let share_btn = el_text("button", "", "Share a window or tab…");
         let view_btn = el_text("button", "", "Resume viewing");
-        for b in [&start_btn, &end_btn, &share_btn, &view_btn] {
+        let scan_btn = el_text("button", "", "Scan page");
+        for b in [&start_btn, &end_btn, &share_btn, &view_btn, &scan_btn] {
             append(&controls, b);
         }
-        let hint = el_text(
-            "p",
-            "hint",
-            "Share a single tab or window, not your whole screen, so notifications and other apps \
-             stay out of view. Log in to your accounts while viewing is paused, then resume. \
-             Ctrl+Shift+V toggles viewing; typing \u{201c}pause viewing\u{201d} pauses at once.",
+        let hint = el("div", "hint");
+        append(
+            &hint,
+            &el_text(
+                "p",
+                "",
+                "Share a single tab or window, not your whole screen, so notifications and other apps \
+                 stay out of view. Log in to your accounts while viewing is paused, then resume. \
+                 Ctrl+Shift+V toggles viewing; typing \u{201c}pause viewing\u{201d} pauses at once.",
+            ),
+        );
+        append(
+            &hint,
+            &el_text(
+                "p",
+                "",
+                "Long page? Scroll it to the top, click Scan page (or Ctrl+Shift+S, or type \u{201c}scan \
+                 this page\u{201d}), scroll slowly to the bottom in the shared tab, then come back here. \
+                 For smoother scans, keep this app in its own window.",
+            ),
         );
 
         let transcript = el("div", "transcript");
@@ -70,12 +98,16 @@ impl CallView {
         let view = Rc::new(Self {
             ws: RefCell::new(None),
             capture: RefCell::new(None),
-            in_call: RefCell::new(false),
+            in_call: Cell::new(false),
+            next_scan_id: Cell::new(1),
+            scan_segments: Cell::new(0),
+            scan_left_app: Cell::new(false),
             indicator,
             start_btn,
             end_btn,
             share_btn,
             view_btn,
+            scan_btn,
             transcript,
             input,
             send_btn,
@@ -103,7 +135,7 @@ impl CallView {
                 if let Some(c) = me.capture.borrow().as_ref() {
                     c.stop_sharing();
                 }
-                *me.in_call.borrow_mut() = false;
+                me.in_call.set(false);
                 me.render();
                 me.set_status("Disconnected from the local server. Reload the page to reconnect.", true);
             }
@@ -112,11 +144,7 @@ impl CallView {
             Ok(ws) => {
                 let capture = Capturer::new(ws.clone());
                 let me = self.clone();
-                capture.set_on_share_ended(move || {
-                    me.ws_send(&ClientMsg::SetViewing { viewing: false });
-                    me.render();
-                    me.set_status("Screen sharing stopped.", false);
-                });
+                capture.set_on_event(move |e| me.on_capture(e));
                 *self.capture.borrow_mut() = Some(capture);
                 *self.ws.borrow_mut() = Some(ws);
             }
@@ -137,7 +165,7 @@ impl CallView {
             wasm_bindgen_futures::spawn_local(async move {
                 let Some(capture) = me.capture.borrow().clone() else { return };
                 match capture.share().await {
-                    Ok(()) => me.set_status("Sharing. Viewing is still paused until you resume.", false),
+                    Ok(()) => me.set_status("Sharing. Viewing is still paused until you resume or scan.", false),
                     Err(e) => me.set_status(&format!("Screen share cancelled or failed: {e:?}"), true),
                 }
                 me.render();
@@ -148,10 +176,34 @@ impl CallView {
         on(&self.view_btn, "click", move |_: web_sys::Event| me.toggle_viewing());
 
         let me = self.clone();
+        on(&self.scan_btn, "click", move |_: web_sys::Event| me.toggle_scan());
+
+        let me = self.clone();
         on(&dom::document(), "keydown", move |e: KeyboardEvent| {
-            if e.ctrl_key() && e.shift_key() && e.key().eq_ignore_ascii_case(VIEWING_HOTKEY_KEY) {
+            if !(e.ctrl_key() && e.shift_key()) {
+                return;
+            }
+            let key = e.key();
+            if key.eq_ignore_ascii_case(VIEWING_HOTKEY_KEY) {
                 e.prevent_default();
                 me.toggle_viewing();
+            } else if key.eq_ignore_ascii_case(SCAN_HOTKEY_KEY) {
+                e.prevent_default();
+                me.toggle_scan();
+            }
+        });
+
+        // Leaving the app and coming back ends a scan.
+        let me = self.clone();
+        on(&dom::window(), "blur", move |_: web_sys::Event| me.note_left_app());
+        let me = self.clone();
+        on(&dom::window(), "focus", move |_: web_sys::Event| me.note_returned());
+        let me = self.clone();
+        on(&dom::document(), "visibilitychange", move |_: web_sys::Event| {
+            if dom::document().hidden() {
+                me.note_left_app();
+            } else {
+                me.note_returned();
             }
         });
 
@@ -177,20 +229,31 @@ impl CallView {
         self.capture.borrow().clone()
     }
 
-    fn viewing(&self) -> bool {
-        self.capture().is_some_and(|c| c.is_viewing())
+    fn mode(&self) -> Mode {
+        self.capture().map_or(Mode::Paused, |c| c.mode())
     }
 
+    fn viewing(&self) -> bool {
+        self.mode() != Mode::Paused
+    }
+
+    fn scanning(&self) -> bool {
+        matches!(self.mode(), Mode::Scanning { .. })
+    }
+
+    /// Explicit pause: stops capture (cancelling any scan) before telling the server.
     fn pause_viewing(&self) {
         if let Some(c) = self.capture() {
-            c.pause(); // stop capturing first, then tell the server
+            if c.pause().is_some() {
+                self.set_status("Scan cancelled.", false);
+            }
         }
         self.ws_send(&ClientMsg::SetViewing { viewing: false });
         self.render();
     }
 
     fn toggle_viewing(&self) {
-        if !*self.in_call.borrow() {
+        if !self.in_call.get() {
             return;
         }
         let Some(c) = self.capture() else { return };
@@ -205,18 +268,101 @@ impl CallView {
         }
     }
 
+    fn toggle_scan(&self) {
+        if self.scanning() {
+            self.finish_scan("");
+        } else {
+            self.start_scan();
+        }
+    }
+
+    fn start_scan(&self) {
+        if !self.in_call.get() {
+            return;
+        }
+        let Some(c) = self.capture() else { return };
+        if !c.has_stream() {
+            self.set_status("Share a window or tab first, then scan.", true);
+            return;
+        }
+        let scan_id = self.next_scan_id.get();
+        self.next_scan_id.set(scan_id + 1);
+        self.scan_segments.set(0);
+        self.scan_left_app.set(false);
+        c.start_scan(scan_id); // capture starts locally at once...
+        self.ws_send(&ClientMsg::StartScan { scan_id }); // ...and the server is told
+        self.set_status(
+            "Scanning. Switch to the shared page, scroll slowly to the bottom, then come back here \
+             (or click Done).",
+            false,
+        );
+        self.render();
+    }
+
+    /// Ends the scan normally and returns to the pre-scan viewing state.
+    fn finish_scan(&self, why: &str) {
+        let Some(c) = self.capture() else { return };
+        let Some(summary) = c.end_scan() else { return };
+        self.ws_send(&ClientMsg::EndScan { scan_id: summary.scan_id });
+        self.set_status(&scan_report(&summary, why), summary.gaps > 0 || summary.segments == 0);
+        self.render();
+    }
+
+    fn note_left_app(&self) {
+        if self.scanning() {
+            self.scan_left_app.set(true);
+        }
+    }
+
+    fn note_returned(&self) {
+        if self.scanning() && self.scan_left_app.get() {
+            self.finish_scan("you came back to the app");
+        }
+    }
+
+    fn on_capture(&self, e: CaptureEvent) {
+        match e {
+            CaptureEvent::ShareEnded => {
+                self.ws_send(&ClientMsg::SetViewing { viewing: false });
+                self.set_status("Screen sharing stopped.", false);
+            }
+            CaptureEvent::Segment { segments, gap_before } => {
+                self.scan_segments.set(segments);
+                if gap_before {
+                    self.set_status(
+                        "You may have skipped part of the page. Scroll back up a little, then continue slowly.",
+                        true,
+                    );
+                }
+            }
+            CaptureEvent::ScanFull => self.finish_scan("it reached the segment limit"),
+        }
+        self.render();
+    }
+
     fn hang_up(&self) {
         if let Some(c) = self.capture() {
             c.stop_sharing();
         }
         self.ws_send(&ClientMsg::EndSession);
-        *self.in_call.borrow_mut() = false;
+        self.in_call.set(false);
         self.render();
     }
 
     fn send_text(&self) {
         let text = self.input.value().trim().to_string();
-        if text.is_empty() || !*self.in_call.borrow() {
+        if text.is_empty() || !self.in_call.get() {
+            return;
+        }
+        // Scan commands are handled here and never sent to Claude.
+        if self.scanning() && is_scan_done_command(&text) {
+            self.input.set_value("");
+            self.finish_scan("");
+            return;
+        }
+        if is_scan_command(&text) {
+            self.input.set_value("");
+            self.start_scan();
             return;
         }
         if is_pause_command(&text) && self.viewing() {
@@ -235,18 +381,24 @@ impl CallView {
                         c.pause();
                     }
                 }
-                *self.in_call.borrow_mut() = true;
+                self.in_call.set(true);
                 self.transcript.set_inner_html("");
                 self.set_status("Call started. Viewing is paused.", false);
             }
             ServerMsg::SessionEnded { .. } => {
-                *self.in_call.borrow_mut() = false;
+                self.in_call.set(false);
                 self.set_status("Call ended.", false);
             }
             ServerMsg::ViewingState { viewing } => {
                 if !viewing && self.viewing() {
                     // Server-requested pause: stop at once and acknowledge.
                     self.pause_viewing();
+                }
+            }
+            ServerMsg::ScanState { active, scan_id, .. } => {
+                // The server ended our scan (e.g. at its segment cap).
+                if !active && matches!(self.mode(), Mode::Scanning { scan_id: id, .. } if id == scan_id) {
+                    self.finish_scan("the server ended it");
                 }
             }
             ServerMsg::UserTurn { text } => {
@@ -305,17 +457,50 @@ impl CallView {
     }
 
     fn render(&self) {
-        let in_call = *self.in_call.borrow();
-        let viewing = self.viewing();
+        let in_call = self.in_call.get();
+        let mode = self.mode();
+        let viewing = mode != Mode::Paused;
+        let scanning = matches!(mode, Mode::Scanning { .. });
         let sharing = self.capture().is_some_and(|c| c.has_stream());
-        set_text(&self.indicator, if viewing { "🔴 VIEWING" } else { "⚪ PAUSED" });
+        let label = match mode {
+            Mode::Paused => "⚪ PAUSED".to_string(),
+            Mode::Viewing => "🔴 VIEWING".to_string(),
+            Mode::Scanning { .. } => format!("🔴 SCANNING ({})", self.scan_segments.get()),
+        };
+        set_text(&self.indicator, &label);
         set_class(&self.indicator, "viewing", viewing);
         set_text(&self.view_btn, if viewing { "Pause viewing" } else { "Resume viewing" });
+        set_text(
+            &self.scan_btn,
+            &if scanning { format!("Done ({} segments)", self.scan_segments.get()) } else { "Scan page".into() },
+        );
+        set_class(&self.scan_btn, "primary", scanning);
         set_disabled(&self.start_btn, in_call);
         set_disabled(&self.end_btn, !in_call);
         set_disabled(&self.share_btn, !in_call);
         set_disabled(&self.view_btn, !in_call || (!viewing && !sharing));
+        set_disabled(&self.scan_btn, !in_call || !sharing);
         set_disabled(&self.send_btn, !in_call);
         set_disabled(&self.input, !in_call);
     }
+}
+
+fn scan_report(s: &ScanSummary, why: &str) -> String {
+    let mut msg = format!("Scan finished: {} segment{}", s.segments, if s.segments == 1 { "" } else { "s" });
+    if !why.is_empty() {
+        msg.push_str(&format!(" ({why})"));
+    }
+    msg.push('.');
+    if s.segments == 0 {
+        msg.push_str(" Nothing was captured; make sure the shared page is visible and scroll a little slower.");
+    } else if s.gaps > 0 {
+        msg.push_str(&format!(" {} possible gap{}; the advisor will be told.", s.gaps, if s.gaps == 1 { "" } else { "s" }));
+    }
+    if s.segments > 0 && s.samples_per_sec < SLOW_SCAN_SAMPLES_PER_SEC {
+        msg.push_str(
+            " Tip: the browser slowed sampling because this tab was in the background. \
+             Keeping the app in its own window gives smoother scans.",
+        );
+    }
+    msg
 }

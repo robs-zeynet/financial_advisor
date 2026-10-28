@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
-use protocol::CaptureSettings;
+use protocol::{CaptureSettings, MAX_SCAN_SEGMENTS_CAP};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,6 +36,9 @@ pub struct ClaudeConfig {
     pub keep_screen_views: u32,
     /// Prompt size (input tokens) at which old screen views start being cleared.
     pub clear_trigger_tokens: u32,
+    /// A clear only happens if it frees at least this many tokens, so the
+    /// cached conversation is rewritten rarely and in large batches.
+    pub clear_at_least_tokens: u32,
     pub max_retries: u32,
 }
 
@@ -43,11 +46,18 @@ pub struct ClaudeConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct CaptureConfig {
     pub sample_interval_ms: u32,
+    pub scan_sample_interval_ms: u32,
+    /// At most 2000 (the API's per-image limit for requests with >20 images).
     pub max_long_edge: u32,
     pub jpeg_quality: f64,
     pub keepalive_ms: u32,
     pub change_threshold_bits: u32,
+    /// At most `MAX_SCAN_SEGMENTS_CAP` (20).
+    pub max_scan_segments: u32,
 }
+
+/// Largest frame long edge the app will ever send or accept (P3).
+pub const MAX_LONG_EDGE_CAP: u32 = 2000;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -78,7 +88,8 @@ impl Default for ClaudeConfig {
             effort: "low".into(),
             deep_effort: "high".into(),
             keep_screen_views: 2,
-            clear_trigger_tokens: 30_000,
+            clear_trigger_tokens: 60_000,
+            clear_at_least_tokens: 15_000,
             max_retries: 4,
         }
     }
@@ -89,10 +100,12 @@ impl Default for CaptureConfig {
         let d = CaptureSettings::default();
         Self {
             sample_interval_ms: d.sample_interval_ms,
+            scan_sample_interval_ms: d.scan_sample_interval_ms,
             max_long_edge: d.max_long_edge,
             jpeg_quality: d.jpeg_quality,
             keepalive_ms: d.keepalive_ms,
             change_threshold_bits: d.change_threshold_bits,
+            max_scan_segments: d.max_scan_segments,
         }
     }
 }
@@ -107,10 +120,12 @@ impl CaptureConfig {
     pub fn settings(&self) -> CaptureSettings {
         CaptureSettings {
             sample_interval_ms: self.sample_interval_ms,
+            scan_sample_interval_ms: self.scan_sample_interval_ms,
             max_long_edge: self.max_long_edge,
             jpeg_quality: self.jpeg_quality,
             keepalive_ms: self.keepalive_ms,
             change_threshold_bits: self.change_threshold_bits,
+            max_scan_segments: self.max_scan_segments,
         }
     }
 }
@@ -123,7 +138,21 @@ impl Config {
         }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        let config: Self = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Enforces the hard caps from the privacy invariants.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let c = &self.capture;
+        if c.max_long_edge == 0 || c.max_long_edge > MAX_LONG_EDGE_CAP {
+            bail!("capture.max_long_edge must be 1..={MAX_LONG_EDGE_CAP} (got {})", c.max_long_edge);
+        }
+        if c.max_scan_segments == 0 || c.max_scan_segments > MAX_SCAN_SEGMENTS_CAP {
+            bail!("capture.max_scan_segments must be 1..={MAX_SCAN_SEGMENTS_CAP} (got {})", c.max_scan_segments);
+        }
+        Ok(())
     }
 
     /// The address to bind, refusing anything that isn't loopback (P7).
@@ -175,6 +204,17 @@ mod tests {
         for bind in ["0.0.0.0:8765", "[::]:8765", "192.168.1.10:8765", "8.8.8.8:80", "localhost:8765"] {
             assert!(with_bind(bind).bind_addr().is_err(), "{bind} should be refused");
         }
+    }
+
+    #[test]
+    fn hard_caps_are_enforced() {
+        assert!(Config::default().validate().is_ok());
+        let mut c = Config::default();
+        c.capture.max_long_edge = 2576;
+        assert!(c.validate().is_err());
+        let mut c = Config::default();
+        c.capture.max_scan_segments = 21;
+        assert!(c.validate().is_err());
     }
 
     #[test]

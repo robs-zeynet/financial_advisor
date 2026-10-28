@@ -23,6 +23,9 @@ pub struct MessagesRequest<'a> {
     pub fallbacks: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_management: Option<Value>,
+    /// Top-level automatic cache breakpoint on the last cacheable block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Clone, Serialize)]
