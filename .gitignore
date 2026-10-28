@@ -1,0 +1,5 @@
+# Private user data: memory, approved summaries, audit records. Never commit.
+/data/
+/target/
+/dist/
+config.toml

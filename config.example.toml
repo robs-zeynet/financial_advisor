@@ -1,0 +1,27 @@
+# Copy to config.toml (gitignored). Secrets never go here: the API key comes
+# from the ANTHROPIC_API_KEY environment variable.
+
+# Must be a loopback address; the server refuses anything else.
+bind = "127.0.0.1:8765"
+data_dir = "data"
+
+[claude]
+model = "claude-opus-5-5"
+api_version = "2026-10-21"
+max_tokens = 16000
+effort = "low"          # conversation turns
+deep_effort = "high"    # deep review and the session summary
+keep_screen_views = 2   # view_screen results kept in context (context editing)
+clear_trigger_tokens = 30000
+max_retries = 4
+
+[capture]
+sample_interval_ms = 1000
+max_long_edge = 2000    # px; see README for why not 1568
+jpeg_quality = 0.8
+keepalive_ms = 10000
+change_threshold_bits = 8   # of 4096 dHash bits
+
+[web_search]
+enabled = false   # off by default; when on, the prompt forbids personal data in queries
+max_uses = 3

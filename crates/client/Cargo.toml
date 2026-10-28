@@ -1,0 +1,29 @@
+[package]
+name = "client"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+protocol = { path = "../protocol" }
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+gloo-timers = { version = "0.3", features = ["futures"] }
+web-sys = { version = "0.3", features = [
+  "Window", "Document", "Element", "HtmlElement", "Node", "Text", "Event", "EventTarget",
+  "KeyboardEvent", "MouseEvent", "HtmlInputElement", "HtmlButtonElement", "HtmlTextAreaElement",
+  "Location", "Navigator", "HtmlCollection", "MediaDevices", "MediaStream", "MediaStreamTrack",
+  "DisplayMediaStreamConstraints", "HtmlVideoElement", "HtmlMediaElement",
+  "HtmlCanvasElement", "CanvasRenderingContext2d", "ImageData", "Blob",
+  "WebSocket", "MessageEvent", "BinaryType", "CloseEvent", "ErrorEvent", "Performance",
+  "DomTokenList", "CssStyleDeclaration", "console",
+] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
