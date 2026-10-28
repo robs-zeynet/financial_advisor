@@ -5,8 +5,9 @@ analyst from your browser and, when you choose, let it see one shared window or
 tab. See `PROMPT.md` for the full spec and privacy invariants.
 
 **Status: M0 (skeleton).** Typed chat with Claude, `view_screen` with the
-capture loop, and pause/resume (P2). Voice, records, memory approval, and the
-full privacy write-up come in M1–M4.
+capture loop, and pause/resume (P2). Next: page scans for long pages (M1),
+screen notes (M2), voice (M3), records (M4), memory approval (M5), and polish
+plus the full privacy write-up (M6).
 
 ## Run
 
@@ -39,4 +40,4 @@ scripts/test.sh
   version. The app sends no sampling parameters, so nothing it uses changed.
 
 The privacy model and the Anthropic API data-retention note will be written
-up here in M4.
+up here in M6.
