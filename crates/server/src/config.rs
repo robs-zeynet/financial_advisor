@@ -17,7 +17,51 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub claude: ClaudeConfig,
     pub capture: CaptureConfig,
+    pub voice: VoiceConfig,
     pub web_search: WebSearchConfig,
+}
+
+/// Local speech: Whisper for speech-to-text, Piper for text-to-speech. Both
+/// run on this machine; neither makes network calls.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VoiceConfig {
+    pub enabled: bool,
+    pub whisper_model: PathBuf,
+    pub whisper_threads: i32,
+    /// Size Whisper's audio context to each utterance (much faster).
+    pub whisper_fit_audio_ctx: bool,
+    pub piper_bin: PathBuf,
+    pub piper_voice: PathBuf,
+    /// Silence that ends an utterance.
+    pub end_silence_ms: u32,
+    /// How far above the noise floor speech must be.
+    pub vad_margin_db: f32,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            whisper_model: "models/ggml-small.en.bin".into(),
+            whisper_threads: 8,
+            whisper_fit_audio_ctx: true,
+            piper_bin: "models/piper/piper".into(),
+            piper_voice: "models/en_US-lessac-medium.onnx".into(),
+            end_silence_ms: 700,
+            vad_margin_db: 12.0,
+        }
+    }
+}
+
+impl VoiceConfig {
+    pub fn vad(&self) -> crate::vad::VadConfig {
+        crate::vad::VadConfig {
+            end_silence_ms: self.end_silence_ms,
+            margin_db: self.vad_margin_db,
+            ..crate::vad::VadConfig::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -73,6 +117,7 @@ impl Default for Config {
             data_dir: PathBuf::from("data"),
             claude: ClaudeConfig::default(),
             capture: CaptureConfig::default(),
+            voice: VoiceConfig::default(),
             web_search: WebSearchConfig::default(),
         }
     }

@@ -1,5 +1,6 @@
 //! Browser client, compiled to WASM. All UI is built with web-sys directly.
 
+pub mod audio;
 pub mod capture;
 pub mod dom;
 pub mod scan;

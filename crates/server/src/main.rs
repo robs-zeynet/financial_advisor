@@ -4,7 +4,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use server::claude::ClaudeClient;
 use server::config::Config;
-use server::session::AppState;
+use server::session::{AppState, Voice};
+use server::stt::WhisperStt;
+use server::tts::PiperTts;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -31,7 +33,8 @@ async fn main() -> anyhow::Result<()> {
         println!("  (web search: off)");
     }
 
-    let app = Arc::new(AppState { claude: ClaudeClient::new(config.claude.clone(), api_key), config });
+    let voice = load_voice(&config.voice);
+    let app = Arc::new(AppState { claude: ClaudeClient::new(config.claude.clone(), api_key), config, voice });
     let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("binding {addr}"))?;
     println!("Open http://{addr} — share a single tab or window, not your whole screen.");
 
@@ -42,4 +45,34 @@ async fn main() -> anyhow::Result<()> {
         _ = tokio::signal::ctrl_c() => println!("Shutting down."),
     }
     Ok(())
+}
+
+/// Loads local speech engines. Missing models disable voice (typed chat still
+/// works) rather than failing startup.
+fn load_voice(cfg: &server::config::VoiceConfig) -> Voice {
+    if !cfg.enabled {
+        println!("Voice: off (voice.enabled = false)");
+        return Voice::default();
+    }
+    let stt = match WhisperStt::load(&cfg.whisper_model, cfg.whisper_threads, cfg.whisper_fit_audio_ctx) {
+        Ok(s) => Some(Arc::new(s) as Arc<dyn server::stt::SpeechToText>),
+        Err(e) => {
+            eprintln!("warning: speech-to-text off: {e:#}. Run scripts/fetch-models.sh.");
+            None
+        }
+    };
+    let tts = match PiperTts::new(&cfg.piper_bin, &cfg.piper_voice) {
+        Ok(t) => Some(Arc::new(t) as Arc<dyn server::tts::TtsEngine>),
+        Err(e) => {
+            eprintln!("warning: spoken replies off: {e:#}. Run scripts/fetch-models.sh.");
+            None
+        }
+    };
+    let on = |b: bool| if b { "on" } else { "off" };
+    println!(
+        "Voice (local, no network): speech-to-text {} (Whisper), spoken replies {} (Piper)",
+        on(stt.is_some()),
+        on(tts.is_some())
+    );
+    Voice { stt, tts }
 }

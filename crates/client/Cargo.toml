@@ -23,6 +23,9 @@ web-sys = { version = "0.3", features = [
   "HtmlCanvasElement", "CanvasRenderingContext2d", "ImageData", "Blob",
   "WebSocket", "MessageEvent", "BinaryType", "CloseEvent", "ErrorEvent", "Performance",
   "DomTokenList", "CssStyleDeclaration", "console",
+  "AudioContext", "BaseAudioContext", "AudioContextOptions", "AudioWorklet", "Worklet", "AudioWorkletNode",
+  "AudioWorkletNodeOptions", "AudioNode", "AudioBuffer", "AudioBufferSourceNode", "AudioScheduledSourceNode",
+  "AudioDestinationNode", "MediaStreamAudioSourceNode", "MediaStreamConstraints", "MessagePort",
 ] }
 
 [dev-dependencies]

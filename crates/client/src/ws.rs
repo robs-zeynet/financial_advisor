@@ -2,6 +2,7 @@
 
 use protocol::{ClientMsg, ServerMsg};
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 use web_sys::{BinaryType, MessageEvent, WebSocket};
 
 use crate::dom;
@@ -15,6 +16,7 @@ impl Ws {
     /// Connects to `/ws` on the page's own host.
     pub fn connect(
         on_msg: impl FnMut(ServerMsg) + 'static,
+        on_binary: impl FnMut(Vec<u8>) + 'static,
         on_open: impl FnMut() + 'static,
         on_close: impl FnMut() + 'static,
     ) -> Result<Self, JsValue> {
@@ -24,8 +26,14 @@ impl Ws {
         socket.set_binary_type(BinaryType::Arraybuffer);
 
         let mut on_msg = on_msg;
+        let mut on_binary = on_binary;
         dom::on(&socket, "message", move |e: MessageEvent| {
-            let Some(text) = e.data().as_string() else { return };
+            let data = e.data();
+            if let Some(buf) = data.dyn_ref::<js_sys::ArrayBuffer>() {
+                on_binary(js_sys::Uint8Array::new(buf).to_vec());
+                return;
+            }
+            let Some(text) = data.as_string() else { return };
             match serde_json::from_str::<ServerMsg>(&text) {
                 Ok(msg) => on_msg(msg),
                 Err(err) => dom::log(&format!("bad server message: {err}")),

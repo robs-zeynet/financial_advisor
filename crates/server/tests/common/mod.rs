@@ -18,12 +18,16 @@ use protocol::{ClientMsg, FrameHeader, ServerMsg};
 use serde_json::Value;
 use server::claude::ClaudeClient;
 use server::config::Config;
-use server::session::AppState;
+use server::session::{AppState, Voice};
+use server::stt::SpeechToText;
+use server::tts::{TtsEngine, TtsFuture};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 pub enum MockReply {
     /// 200 with an SSE body from `tests/fixtures/<name>`.
     Sse(&'static str),
+    /// Like `Sse`, but each event is delayed by `gap_ms`.
+    SlowSse(&'static str, u64),
     /// An HTTP error with optional `retry-after`.
     Status { status: u16, retry_after: Option<&'static str>, body: &'static str },
 }
@@ -66,6 +70,14 @@ pub async fn spawn_mock_claude(replies: Vec<MockReply>) -> MockClaude {
                     MockReply::Sse(name) => {
                         ([("content-type", "text/event-stream")], fixture(name)).into_response()
                     }
+                    MockReply::SlowSse(name, gap_ms) => {
+                        let events: Vec<String> = fixture(name).split("\n\n").map(|e| format!("{e}\n\n")).collect();
+                        let stream = futures_util::stream::iter(events).then(move |e| async move {
+                            tokio::time::sleep(Duration::from_millis(gap_ms)).await;
+                            Ok::<_, std::convert::Infallible>(e)
+                        });
+                        ([("content-type", "text/event-stream")], axum::body::Body::from_stream(stream)).into_response()
+                    }
                     MockReply::Status { status, retry_after, body } => {
                         let mut r = (StatusCode::from_u16(status).unwrap(), body.to_string()).into_response();
                         if let Some(ra) = retry_after {
@@ -92,9 +104,14 @@ pub fn test_config(data_dir: &Path, base_url: &str) -> Config {
 }
 
 pub async fn spawn_app(config: Config) -> (SocketAddr, Arc<AppState>) {
+    spawn_app_with_voice(config, Voice::default()).await
+}
+
+pub async fn spawn_app_with_voice(config: Config, voice: Voice) -> (SocketAddr, Arc<AppState>) {
     let app = Arc::new(AppState {
         claude: ClaudeClient::new(config.claude.clone(), Some("test-key".into())),
         config,
+        voice,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -105,14 +122,81 @@ pub async fn spawn_app(config: Config) -> (SocketAddr, Arc<AppState>) {
 
 type Socket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// Speech-to-text that returns scripted transcripts in order and records
+/// the length of each utterance it was given.
+#[derive(Default)]
+pub struct FakeStt {
+    pub transcripts: Mutex<VecDeque<String>>,
+    pub heard_samples: Mutex<Vec<usize>>,
+}
+
+impl FakeStt {
+    pub fn new(transcripts: &[&str]) -> Arc<Self> {
+        Arc::new(Self {
+            transcripts: Mutex::new(transcripts.iter().map(|s| s.to_string()).collect()),
+            heard_samples: Mutex::default(),
+        })
+    }
+}
+
+impl SpeechToText for FakeStt {
+    fn transcribe(&self, pcm: &[i16]) -> anyhow::Result<String> {
+        self.heard_samples.lock().unwrap().push(pcm.len());
+        Ok(self.transcripts.lock().unwrap().pop_front().unwrap_or_default())
+    }
+}
+
+/// Text-to-speech producing `secs_per_sentence` of silence per sentence at
+/// 16 kHz, so playback timing is predictable.
+pub struct FakeTts {
+    pub secs_per_sentence: f64,
+    pub spoken: Mutex<Vec<String>>,
+}
+
+impl FakeTts {
+    pub fn new(secs_per_sentence: f64) -> Arc<Self> {
+        Arc::new(Self { secs_per_sentence, spoken: Mutex::default() })
+    }
+}
+
+impl TtsEngine for FakeTts {
+    fn sample_rate(&self) -> u32 {
+        16_000
+    }
+
+    fn synthesize<'a>(&'a self, text: &'a str) -> TtsFuture<'a> {
+        self.spoken.lock().unwrap().push(text.to_string());
+        let n = (self.secs_per_sentence * 16_000.0) as usize;
+        Box::pin(async move { Ok(vec![1i16; n]) })
+    }
+}
+
+/// 16 kHz mic audio: a tone at `db` dBFS (or near-silence for very low `db`).
+pub fn mic_audio(ms: u32, db: f32) -> Vec<i16> {
+    let amp = 10f32.powf(db / 20.0) * 32768.0 * std::f32::consts::SQRT_2;
+    (0..(ms as usize * 16))
+        .map(|i| (amp * (2.0 * std::f32::consts::PI * 220.0 * i as f32 / 16_000.0).sin()) as i16)
+        .collect()
+}
+
 pub struct FakeClient {
     socket: Socket,
+    /// TTS audio messages received so far.
+    pub audio: Vec<Vec<u8>>,
 }
 
 impl FakeClient {
     pub async fn connect(addr: SocketAddr) -> Self {
         let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await.unwrap();
-        Self { socket }
+        Self { socket, audio: Vec::new() }
+    }
+
+    /// Sends mic audio in 20 ms chunks, as the browser does.
+    pub async fn send_mic(&mut self, pcm: &[i16]) {
+        for chunk in pcm.chunks(320) {
+            let bytes = protocol::encode_mic(chunk);
+            self.socket.send(WsMessage::Binary(bytes.into())).await.unwrap();
+        }
     }
 
     pub async fn send(&mut self, msg: ClientMsg) {
@@ -154,8 +238,10 @@ impl FakeClient {
                 .expect("timed out waiting for server message")
                 .expect("socket closed")
                 .unwrap();
-            if let WsMessage::Text(t) = msg {
-                return serde_json::from_str(&t).unwrap();
+            match msg {
+                WsMessage::Text(t) => return serde_json::from_str(&t).unwrap(),
+                WsMessage::Binary(b) => self.audio.push(b.to_vec()),
+                _ => {}
             }
         }
     }

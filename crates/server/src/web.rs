@@ -16,7 +16,7 @@ use protocol::{ClientMsg, ServerMsg, TAG_FRAME, TAG_MIC_PCM};
 use rust_embed::RustEmbed;
 use tokio::sync::mpsc;
 
-use crate::session::{AppState, Session};
+use crate::session::{AppState, Outbound, Session, SessionEvent};
 
 /// The trunk build output, embedded so the app ships as one executable.
 #[derive(RustEmbed)]
@@ -80,25 +80,48 @@ async fn ws_upgrade(State(app): State<Arc<AppState>>, ws: WebSocketUpgrade) -> R
 
 async fn connection(app: Arc<AppState>, socket: WebSocket) {
     let (mut sink, mut stream) = socket.split();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMsg>();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Outbound>();
     let writer = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            let text = serde_json::to_string(&msg).expect("ServerMsg serializes");
-            if sink.send(WsMessage::Text(text.into())).await.is_err() {
+        while let Some(out) = out_rx.recv().await {
+            let msg = match out {
+                Outbound::Msg(m) => WsMessage::Text(serde_json::to_string(&m).expect("ServerMsg serializes").into()),
+                Outbound::Audio(bytes) => WsMessage::Binary(bytes.into()),
+            };
+            if sink.send(msg).await.is_err() {
                 break;
             }
         }
     });
+    let send = |msg: ServerMsg| {
+        let _ = out_tx.send(Outbound::Msg(msg));
+    };
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel::<SessionEvent>();
 
     let mut session: Option<Session> = None;
     let mut violations_without_session: u64 = 0;
-    while let Some(Ok(msg)) = stream.next().await {
+    loop {
+        let msg = tokio::select! {
+            m = stream.next() => match m {
+                Some(Ok(m)) => m,
+                _ => break,
+            },
+            Some(event) = events_rx.recv() => {
+                match event {
+                    SessionEvent::Transcript { session_id, text } => {
+                        if let Some(s) = session.as_mut().filter(|s| s.id == session_id) {
+                            s.voice_text(text);
+                        }
+                    }
+                }
+                continue;
+            }
+        };
         match msg {
             WsMessage::Text(text) => {
                 let msg: ClientMsg = match serde_json::from_str(&text) {
                     Ok(m) => m,
                     Err(e) => {
-                        let _ = out_tx.send(ServerMsg::Error { message: format!("bad message: {e}") });
+                        send(ServerMsg::Error { message: format!("bad message: {e}") });
                         continue;
                     }
                 };
@@ -107,14 +130,12 @@ async fn connection(app: Arc<AppState>, socket: WebSocket) {
                         if let Some(mut old) = session.take() {
                             old.end();
                         }
-                        match Session::start(app.clone(), out_tx.clone()) {
+                        match Session::start(app.clone(), out_tx.clone(), events_tx.clone()) {
                             Ok(s) => {
                                 tracing::info!(session = %s.id, "session started (viewing PAUSED)");
                                 session = Some(s);
                             }
-                            Err(e) => {
-                                let _ = out_tx.send(ServerMsg::Error { message: format!("start failed: {e}") });
-                            }
+                            Err(e) => send(ServerMsg::Error { message: format!("start failed: {e}") }),
                         }
                     }
                     ClientMsg::EndSession => {
@@ -125,15 +146,11 @@ async fn connection(app: Arc<AppState>, socket: WebSocket) {
                     }
                     ClientMsg::SetViewing { viewing } => match session.as_mut() {
                         Some(s) => s.set_viewing(viewing),
-                        None => {
-                            let _ = out_tx.send(ServerMsg::ViewingState { viewing: false });
-                        }
+                        None => send(ServerMsg::ViewingState { viewing: false }),
                     },
                     ClientMsg::StartScan { scan_id } => match session.as_mut() {
                         Some(s) => s.start_scan(scan_id),
-                        None => {
-                            let _ = out_tx.send(ServerMsg::ScanState { active: false, scan_id, segments: 0, gaps: 0 });
-                        }
+                        None => send(ServerMsg::ScanState { active: false, scan_id, segments: 0, gaps: 0 }),
                     },
                     ClientMsg::EndScan { scan_id } => {
                         if let Some(s) = session.as_mut() {
@@ -142,10 +159,23 @@ async fn connection(app: Arc<AppState>, socket: WebSocket) {
                     }
                     ClientMsg::UserText { text } => match session.as_mut() {
                         Some(s) => s.user_text(text),
-                        None => {
-                            let _ = out_tx.send(ServerMsg::Error { message: "start a call first".into() });
-                        }
+                        None => send(ServerMsg::Error { message: "start a call first".into() }),
                     },
+                    ClientMsg::MicState { on } => {
+                        if let Some(s) = session.as_mut() {
+                            s.mic_state(on);
+                        }
+                    }
+                    ClientMsg::PttDown => {
+                        if let Some(s) = session.as_mut() {
+                            s.ptt_down();
+                        }
+                    }
+                    ClientMsg::PttUp => {
+                        if let Some(s) = session.as_mut() {
+                            s.ptt_up();
+                        }
+                    }
                 }
             }
             WsMessage::Binary(data) => match (data.first().copied(), session.as_mut()) {
@@ -153,12 +183,13 @@ async fn connection(app: Arc<AppState>, socket: WebSocket) {
                 (Some(TAG_FRAME), None) => {
                     // No call means viewing is paused: drop and count.
                     violations_without_session += 1;
-                    let _ = out_tx.send(ServerMsg::ProtocolViolation {
+                    send(ServerMsg::ProtocolViolation {
                         detail: "screen frame received with no active call; dropped".into(),
                         total: violations_without_session,
                     });
                 }
-                (Some(TAG_MIC_PCM), _) => {} // voice arrives in M1
+                (Some(TAG_MIC_PCM), Some(s)) => s.handle_mic(&data),
+                (Some(TAG_MIC_PCM), None) => {} // no call: mic audio is ignored
                 (tag, _) => tracing::warn!(?tag, "unknown binary message dropped"),
             },
             WsMessage::Close(_) => break,

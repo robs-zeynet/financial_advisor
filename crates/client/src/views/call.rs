@@ -7,12 +7,13 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use protocol::{
-    is_pause_command, is_scan_command, is_scan_done_command, ClientMsg, ServerMsg, SCAN_HOTKEY_KEY,
-    VIEWING_HOTKEY_KEY,
+    is_pause_command, is_scan_command, is_scan_done_command, ClientMsg, ListenState, ServerMsg, SpokenCommand,
+    VoiceCaps, SCAN_HOTKEY_KEY, VIEWING_HOTKEY_KEY,
 };
 use wasm_bindgen::JsCast;
 use web_sys::{Element, HtmlTextAreaElement, KeyboardEvent};
 
+use crate::audio::{Mic, Player};
 use crate::capture::{CaptureEvent, Capturer, Mode};
 use crate::dom::{self, append, el, el_text, on, set_class, set_disabled, set_text};
 use crate::scan::ScanSummary;
@@ -30,6 +31,14 @@ pub struct CallView {
     scan_segments: Cell<u32>,
     /// The app lost focus or visibility during the scan; regaining it ends the scan.
     scan_left_app: Cell<bool>,
+    voice: Cell<VoiceCaps>,
+    mic: RefCell<Option<Rc<Mic>>>,
+    player: RefCell<Option<Rc<Player>>>,
+    listen: Cell<ListenState>,
+    ptt_held: Cell<bool>,
+    mic_btn: Element,
+    meter_fill: Element,
+    voice_status: Element,
     indicator: Element,
     start_btn: Element,
     end_btn: Element,
@@ -62,9 +71,17 @@ impl CallView {
         let share_btn = el_text("button", "", "Share a window or tab…");
         let view_btn = el_text("button", "", "Resume viewing");
         let scan_btn = el_text("button", "", "Scan page");
-        for b in [&start_btn, &end_btn, &share_btn, &view_btn, &scan_btn] {
+        let mic_btn = el_text("button", "", "Mic on");
+        for b in [&start_btn, &end_btn, &share_btn, &view_btn, &scan_btn, &mic_btn] {
             append(&controls, b);
         }
+        let voice_row = el("div", "voice-row");
+        let meter = el("div", "meter");
+        let meter_fill = el("div", "meter-fill");
+        append(&meter, &meter_fill);
+        let voice_status = el("span", "voice-status");
+        append(&voice_row, &meter);
+        append(&voice_row, &voice_status);
         let hint = el("div", "hint");
         append(
             &hint,
@@ -81,9 +98,18 @@ impl CallView {
             &el_text(
                 "p",
                 "",
-                "Long page? Scroll it to the top, click Scan page (or Ctrl+Shift+S, or type \u{201c}scan \
-                 this page\u{201d}), scroll slowly to the bottom in the shared tab, then come back here. \
-                 For smoother scans, keep this app in its own window.",
+                "Long page? Scroll it to the top, click Scan page (or Ctrl+Shift+S, or say or type \u{201c}scan \
+                 this page\u{201d}), scroll slowly to the bottom in the shared tab, then come back here or \
+                 say \u{201c}done.\u{201d} For smoother scans, keep this app in its own window.",
+            ),
+        );
+        append(
+            &hint,
+            &el_text(
+                "p",
+                "",
+                "Just talk; the advisor answers out loud. Talking over it stops it. Hold Space to talk \
+                 push-to-talk style; audio is never stored.",
             ),
         );
 
@@ -108,7 +134,7 @@ impl CallView {
         append(&input_row, &send_btn);
         let status = el("div", "status");
 
-        for e in [&header, &controls, &hint, &panes, &input_row, &status] {
+        for e in [&header, &controls, &voice_row, &hint, &panes, &input_row, &status] {
             append(root, e);
         }
 
@@ -119,6 +145,14 @@ impl CallView {
             next_scan_id: Cell::new(1),
             scan_segments: Cell::new(0),
             scan_left_app: Cell::new(false),
+            voice: Cell::new(VoiceCaps::default()),
+            mic: RefCell::new(None),
+            player: RefCell::new(None),
+            listen: Cell::new(ListenState::Idle),
+            ptt_held: Cell::new(false),
+            mic_btn,
+            meter_fill,
+            voice_status,
             indicator,
             start_btn,
             end_btn,
@@ -146,6 +180,14 @@ impl CallView {
             let me = self.clone();
             move |msg| me.on_server(msg)
         };
+        let on_binary = {
+            let me = self.clone();
+            move |bytes: Vec<u8>| {
+                if let Some(p) = me.player.borrow().as_ref() {
+                    p.play(&bytes);
+                }
+            }
+        };
         let on_open = {
             let me = self.clone();
             move || me.set_status("Connected.", false)
@@ -161,7 +203,7 @@ impl CallView {
                 me.set_status("Disconnected from the local server. Reload the page to reconnect.", true);
             }
         };
-        match Ws::connect(on_msg, on_open, on_close) {
+        match Ws::connect(on_msg, on_binary, on_open, on_close) {
             Ok(ws) => {
                 let capture = Capturer::new(ws.clone());
                 let me = self.clone();
@@ -175,7 +217,40 @@ impl CallView {
 
     fn wire(self: &Rc<Self>) {
         let me = self.clone();
-        on(&self.start_btn, "click", move |_: web_sys::Event| me.ws_send(&ClientMsg::StartSession));
+        on(&self.start_btn, "click", move |_: web_sys::Event| {
+            // Audio must start from a click for the browser to allow it.
+            me.start_audio();
+            me.ws_send(&ClientMsg::StartSession);
+        });
+
+        let me = self.clone();
+        on(&self.mic_btn, "click", move |_: web_sys::Event| me.toggle_mic());
+
+        // Push-to-talk: hold Space (outside text fields).
+        let me = self.clone();
+        on(&dom::document(), "keydown", move |e: KeyboardEvent| {
+            if e.code() == "Space" && !typing_target(&e) && me.in_call.get() && me.voice.get().stt {
+                e.prevent_default();
+                if !e.repeat() && !me.ptt_held.get() {
+                    me.ptt_held.set(true);
+                    me.ws_send(&ClientMsg::PttDown);
+                    me.render();
+                }
+            }
+        });
+        let me = self.clone();
+        on(&dom::document(), "keyup", move |e: KeyboardEvent| {
+            if e.code() == "Space" && me.ptt_held.get() {
+                e.prevent_default();
+                me.ptt_held.set(false);
+                me.ws_send(&ClientMsg::PttUp);
+                me.render();
+            }
+        });
+
+        // Keep the "Speaking" status current while audio plays.
+        let me = self.clone();
+        gloo_timers::callback::Interval::new(250, move || me.render_voice()).forget();
 
         let me = self.clone();
         on(&self.end_btn, "click", move |_: web_sys::Event| me.hang_up());
@@ -361,10 +436,66 @@ impl CallView {
         self.render();
     }
 
+    /// Creates the player and starts the mic (from the Start call click).
+    fn start_audio(self: &Rc<Self>) {
+        if self.player.borrow().is_none() {
+            match Player::new() {
+                Ok(p) => *self.player.borrow_mut() = Some(p),
+                Err(e) => dom::log(&format!("audio playback unavailable: {e:?}")),
+            }
+        }
+        if self.mic.borrow().is_some() {
+            return;
+        }
+        let Some(ws) = self.ws.borrow().clone() else { return };
+        let me = self.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let level = {
+                let fill = me.meter_fill.clone();
+                move |l: f32| {
+                    let _ = fill.set_attribute("style", &format!("width: {:.0}%", l * 100.0));
+                }
+            };
+            match Mic::start(ws, level).await {
+                Ok(mic) => {
+                    if me.in_call.get() && !me.voice.get().stt {
+                        mic.stop(); // the server can't transcribe; don't hold the mic
+                    } else {
+                        *me.mic.borrow_mut() = Some(mic);
+                    }
+                }
+                Err(e) => me.set_status(&format!("Microphone unavailable ({e:?}); typing still works."), true),
+            }
+            me.render();
+        });
+    }
+
+    fn toggle_mic(&self) {
+        let Some(mic) = self.mic.borrow().clone() else { return };
+        let on = !mic.is_on();
+        mic.set_on(on);
+        if !on {
+            let _ = self.meter_fill.set_attribute("style", "width: 0%");
+        }
+        self.ws_send(&ClientMsg::MicState { on });
+        self.render();
+    }
+
+    fn stop_audio(&self) {
+        if let Some(mic) = self.mic.borrow_mut().take() {
+            mic.stop();
+        }
+        if let Some(p) = self.player.borrow().as_ref() {
+            p.stop_all();
+        }
+        let _ = self.meter_fill.set_attribute("style", "width: 0%");
+    }
+
     fn hang_up(&self) {
         if let Some(c) = self.capture() {
             c.stop_sharing();
         }
+        self.stop_audio();
         self.ws_send(&ClientMsg::EndSession);
         self.in_call.set(false);
         self.render();
@@ -395,7 +526,13 @@ impl CallView {
 
     fn on_server(&self, msg: ServerMsg) {
         match msg {
-            ServerMsg::SessionStarted { capture, viewing, .. } => {
+            ServerMsg::SessionStarted { capture, viewing, voice, .. } => {
+                self.voice.set(voice);
+                if !voice.stt {
+                    if let Some(mic) = self.mic.borrow_mut().take() {
+                        mic.stop();
+                    }
+                }
                 if let Some(c) = self.capture() {
                     c.state.borrow_mut().set_settings(capture);
                     if !viewing {
@@ -442,6 +579,27 @@ impl CallView {
                 self.close_current();
             }
             ServerMsg::ScreenNote { id, page, notes, revision } => self.show_note(id, &page, &notes, revision),
+            ServerMsg::Listen { state } => self.listen.set(state),
+            ServerMsg::StopAudio { utterance_id } => {
+                if let Some(p) = self.player.borrow().as_ref() {
+                    p.stop(utterance_id);
+                }
+            }
+            ServerMsg::CommandHeard { text, command } => {
+                let what = match command {
+                    SpokenCommand::StartScan => "start a page scan",
+                    SpokenCommand::EndScan => "finish the page scan",
+                    SpokenCommand::PauseViewing => "pause viewing",
+                };
+                let line = el_text("div", "tool", &format!("[heard \u{201c}{text}\u{201d}: {what}]"));
+                append(&self.transcript, &line);
+                self.scroll_to_end();
+                match command {
+                    SpokenCommand::StartScan => self.start_scan(),
+                    SpokenCommand::EndScan => self.finish_scan("you said done"),
+                    SpokenCommand::PauseViewing => self.pause_viewing(),
+                }
+            }
             ServerMsg::ToolActivity { tool, detail } => {
                 let line = el_text("div", "tool", &format!("[{tool}: {detail}]"));
                 append(&self.transcript, &line);
@@ -544,6 +702,37 @@ impl CallView {
         set_disabled(&self.scan_btn, !in_call || !sharing);
         set_disabled(&self.send_btn, !in_call);
         set_disabled(&self.input, !in_call);
+        let mic_on = self.mic.borrow().as_ref().map(|m| m.is_on());
+        set_text(&self.mic_btn, if mic_on == Some(false) { "Mic off" } else { "Mic on" });
+        set_class(&self.mic_btn, "muted", mic_on == Some(false));
+        set_disabled(&self.mic_btn, !in_call || mic_on.is_none());
+        self.render_voice();
+    }
+
+    /// The voice status line: what the voice pipeline is doing right now.
+    fn render_voice(&self) {
+        let speaking = self.player.borrow().as_ref().is_some_and(|p| p.is_playing());
+        let mic_on = self.mic.borrow().as_ref().map(|m| m.is_on());
+        let text = if !self.in_call.get() {
+            ""
+        } else if self.ptt_held.get() {
+            "Push-to-talk: listening…"
+        } else if self.listen.get() == ListenState::Hearing {
+            "Hearing you…"
+        } else if self.listen.get() == ListenState::Transcribing {
+            "Transcribing…"
+        } else if speaking {
+            "Speaking (talk to interrupt)"
+        } else if !self.voice.get().stt {
+            "Voice unavailable: type instead"
+        } else if mic_on == Some(false) {
+            "Mic off"
+        } else if mic_on == Some(true) {
+            "Listening"
+        } else {
+            ""
+        };
+        set_text(&self.voice_status, text);
     }
 }
 
@@ -565,4 +754,11 @@ fn scan_report(s: &ScanSummary, why: &str) -> String {
         );
     }
     msg
+}
+
+/// Whether a key event is aimed at a text field (so Space types a space).
+fn typing_target(e: &KeyboardEvent) -> bool {
+    e.target()
+        .and_then(|t| t.dyn_into::<Element>().ok())
+        .is_some_and(|el| matches!(el.tag_name().as_str(), "TEXTAREA" | "INPUT" | "BUTTON"))
 }

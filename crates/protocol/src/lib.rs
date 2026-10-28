@@ -6,11 +6,13 @@
 
 use serde::{Deserialize, Serialize};
 
-/// PCM16 mic audio at 16 kHz (client -> server).
+/// PCM16 mic audio at 16 kHz (client -> server): `tag | pcm16 LE...`.
 pub const TAG_MIC_PCM: u8 = 0x01;
+/// Mic sample rate.
+pub const MIC_SAMPLE_RATE: u32 = 16_000;
 /// JPEG screen frame (client -> server). See [`FrameHeader`].
 pub const TAG_FRAME: u8 = 0x02;
-/// TTS PCM audio (server -> client).
+/// TTS PCM audio (server -> client). See [`TtsHeader`].
 pub const TAG_TTS_PCM: u8 = 0x03;
 
 /// Hotkey that toggles viewing: Ctrl+Shift+V.
@@ -47,6 +49,50 @@ pub fn is_scan_command(text: &str) -> bool {
     )
 }
 
+/// Commands recognized in speech and handled locally, never sent to Claude
+/// (except "pause viewing", which pauses first and then reaches the model).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpokenCommand {
+    PauseViewing,
+    StartScan,
+    EndScan,
+}
+
+/// Recognizes a spoken command in a short transcript. Speech-to-text adds
+/// fillers and punctuation ("Okay, scan this page."), so leading fillers are
+/// dropped and the rest must be one of the command phrases.
+pub fn spoken_command(text: &str) -> Option<SpokenCommand> {
+    const FILLERS: &[&str] = &["okay", "ok", "alright", "so", "um", "uh", "please", "now", "and", "right"];
+    let t: String = text
+        .to_lowercase()
+        .replace("all right", "alright")
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '\'' { c } else { ' ' })
+        .collect();
+    let mut words: Vec<&str> = t.split_whitespace().collect();
+    while let Some(first) = words.first() {
+        if FILLERS.contains(first) {
+            words.remove(0);
+        } else {
+            break;
+        }
+    }
+    while matches!(words.last(), Some(&"please") | Some(&"now") | Some(&"thanks")) {
+        words.pop();
+    }
+    let rest = words.join(" ");
+    if is_pause_command(&rest) && words.len() <= 6 {
+        Some(SpokenCommand::PauseViewing)
+    } else if is_scan_command(&rest) {
+        Some(SpokenCommand::StartScan)
+    } else if is_scan_done_command(&rest) {
+        Some(SpokenCommand::EndScan)
+    } else {
+        None
+    }
+}
+
 /// "done" and close variants, meaning "finish the scan". Only a command while
 /// a scan is running.
 pub fn is_scan_done_command(text: &str) -> bool {
@@ -73,8 +119,35 @@ pub enum ClientMsg {
     StartScan { scan_id: u32 },
     /// The user finished the page scan.
     EndScan { scan_id: u32 },
-    /// Typed user input (M0); voice turns arrive as audio in M3.
+    /// Typed user input. Spoken input arrives as `TAG_MIC_PCM` audio.
     UserText { text: String },
+    /// The mic was switched on or off. Off discards any partial utterance.
+    MicState { on: bool },
+    /// Push-to-talk (hold Space): speech starts now, regardless of the VAD...
+    PttDown,
+    /// ...and ends now.
+    PttUp,
+}
+
+/// What the server can do with voice this session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct VoiceCaps {
+    /// Speech-to-text is available (mic audio is used).
+    pub stt: bool,
+    /// Replies are spoken.
+    pub tts: bool,
+}
+
+/// The listening side of the voice pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenState {
+    /// Waiting for speech.
+    Idle,
+    /// The user is speaking.
+    Hearing,
+    /// Turning the utterance into text.
+    Transcribing,
 }
 
 /// Messages the server sends to the browser.
@@ -85,6 +158,7 @@ pub enum ServerMsg {
         session_id: String,
         viewing: bool,
         capture: CaptureSettings,
+        voice: VoiceCaps,
     },
     SessionEnded {
         session_id: String,
@@ -106,6 +180,20 @@ pub enum ServerMsg {
     /// Echo of what the server recorded as the user's turn.
     UserTurn {
         text: String,
+    },
+    /// Voice pipeline state, for the UI.
+    Listen {
+        state: ListenState,
+    },
+    /// A spoken command was recognized and handled locally. The client
+    /// carries out scan commands (capture lives in the browser).
+    CommandHeard {
+        text: String,
+        command: SpokenCommand,
+    },
+    /// Stop playing this utterance now (barge-in or cancelled turn).
+    StopAudio {
+        utterance_id: u32,
     },
     /// Streaming assistant text.
     AssistantDelta {
@@ -194,6 +282,66 @@ pub struct FrameHeader {
     /// The segment didn't overlap the previous one: part of the page between
     /// them may be missing.
     pub gap_before: bool,
+}
+
+/// Header of a `TAG_TTS_PCM` binary message (big-endian):
+/// `tag u8 | utterance_id u32 | sentence_index u16 | sample_rate u32 | pcm16 LE...`
+///
+/// One message per synthesized sentence; the client plays them back to back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TtsHeader {
+    pub utterance_id: u32,
+    pub sentence_index: u16,
+    pub sample_rate: u32,
+}
+
+pub const TTS_HEADER_LEN: usize = 1 + 4 + 2 + 4;
+
+impl TtsHeader {
+    pub fn encode(&self, pcm: &[i16]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(TTS_HEADER_LEN + pcm.len() * 2);
+        out.push(TAG_TTS_PCM);
+        out.extend_from_slice(&self.utterance_id.to_be_bytes());
+        out.extend_from_slice(&self.sentence_index.to_be_bytes());
+        out.extend_from_slice(&self.sample_rate.to_be_bytes());
+        for s in pcm {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        out
+    }
+
+    /// Splits a TTS message into its header and PCM16 LE payload bytes.
+    pub fn decode(msg: &[u8]) -> Result<(TtsHeader, &[u8]), FrameDecodeError> {
+        if msg.len() < TTS_HEADER_LEN {
+            return Err(FrameDecodeError::TooShort);
+        }
+        if msg[0] != TAG_TTS_PCM {
+            return Err(FrameDecodeError::WrongTag(msg[0]));
+        }
+        Ok((
+            TtsHeader {
+                utterance_id: u32::from_be_bytes(msg[1..5].try_into().unwrap()),
+                sentence_index: u16::from_be_bytes(msg[5..7].try_into().unwrap()),
+                sample_rate: u32::from_be_bytes(msg[7..11].try_into().unwrap()),
+            },
+            &msg[TTS_HEADER_LEN..],
+        ))
+    }
+}
+
+/// Encodes mic samples as a `TAG_MIC_PCM` message.
+pub fn encode_mic(pcm: &[i16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + pcm.len() * 2);
+    out.push(TAG_MIC_PCM);
+    for s in pcm {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
+/// Decodes the samples of a `TAG_MIC_PCM` message (odd trailing byte dropped).
+pub fn decode_mic(msg: &[u8]) -> Vec<i16> {
+    msg.get(1..).unwrap_or_default().chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect()
 }
 
 pub const FRAME_HEADER_LEN: usize = 1 + 1 + 8 + 2 + 2 + 4 + 2 + 4;
@@ -323,6 +471,27 @@ mod tests {
         assert!(is_scan_done_command("Done!"));
         assert!(is_scan_done_command("I'm done"));
         assert!(!is_scan_done_command("done with fees, now taxes?"));
+    }
+
+    #[test]
+    fn audio_round_trip() {
+        let h = TtsHeader { utterance_id: 9, sentence_index: 2, sample_rate: 22_050 };
+        let msg = h.encode(&[1, -2, i16::MAX]);
+        let (h2, body) = TtsHeader::decode(&msg).unwrap();
+        assert_eq!(h, h2);
+        assert_eq!(body.len(), 6);
+        assert_eq!(decode_mic(&encode_mic(&[0, -1, 300])), vec![0, -1, 300]);
+    }
+
+    #[test]
+    fn spoken_commands() {
+        use SpokenCommand::*;
+        assert_eq!(spoken_command("Okay, scan this page."), Some(StartScan));
+        assert_eq!(spoken_command("Done."), Some(EndScan));
+        assert_eq!(spoken_command("all right, I'm done"), Some(EndScan));
+        assert_eq!(spoken_command("Pause viewing, please."), Some(PauseViewing));
+        assert_eq!(spoken_command("Can you scan this page and tell me the fees?"), None);
+        assert_eq!(spoken_command("I'm done with my taxes, what about dividends?"), None);
     }
 
     #[test]

@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use protocol::{is_pause_command, FrameHeader, ServerMsg};
+use protocol::{
+    decode_mic, is_pause_command, spoken_command, FrameHeader, ListenState, ServerMsg, SpokenCommand, VoiceCaps,
+};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -22,10 +24,41 @@ use crate::config::Config;
 use crate::frames::{FrameRing, ScanBuffer, ScanReject};
 use crate::memory;
 use crate::screen_notes::ScreenNotes;
+use crate::stt::SpeechToText;
+use crate::tts::{SentenceChunker, Speaker, TtsEngine};
+use crate::vad::{Vad, VadEvent};
 
 pub struct AppState {
     pub config: Config,
     pub claude: ClaudeClient,
+    pub voice: Voice,
+}
+
+/// Local voice engines, when available.
+#[derive(Clone, Default)]
+pub struct Voice {
+    pub stt: Option<Arc<dyn SpeechToText>>,
+    pub tts: Option<Arc<dyn TtsEngine>>,
+}
+
+impl Voice {
+    pub fn caps(&self) -> VoiceCaps {
+        VoiceCaps { stt: self.stt.is_some(), tts: self.tts.is_some() }
+    }
+}
+
+/// What the session sends to the browser: JSON events or TTS audio.
+#[derive(Debug)]
+pub enum Outbound {
+    Msg(ServerMsg),
+    Audio(Vec<u8>),
+}
+
+/// Results of background work, delivered back to the connection loop.
+#[derive(Debug)]
+pub enum SessionEvent {
+    /// Speech-to-text finished for an utterance in session `session_id`.
+    Transcript { session_id: String, text: String },
 }
 
 /// State touched by both the WebSocket reader and the turn task.
@@ -44,6 +77,11 @@ pub struct Shared {
     pub violations: u64,
     /// Viewing-state notes for the model, appended after the next user message.
     pub pending_notes: Vec<String>,
+    /// A turn task is running (its text may still be streaming).
+    pub turn_running: bool,
+    /// Full text of the last completed reply, for barge-in after it finished
+    /// streaming but while it was still being spoken.
+    pub last_reply: String,
 }
 
 impl Shared {
@@ -72,8 +110,12 @@ pub struct Session {
     app: Arc<AppState>,
     shared: Arc<Mutex<Shared>>,
     conv: Arc<tokio::sync::Mutex<Conversation>>,
-    out: mpsc::UnboundedSender<ServerMsg>,
+    out: mpsc::UnboundedSender<Outbound>,
+    events: mpsc::UnboundedSender<SessionEvent>,
     turn_cancel: Option<CancellationToken>,
+    vad: Vad,
+    mic_on: bool,
+    speaker: Option<Arc<Speaker>>,
 }
 
 const NOTE_RESUMED: &str =
@@ -99,25 +141,35 @@ fn scan_finished_note(segments: usize, gaps: &[usize]) -> String {
 
 impl Session {
     /// Starts a session. Viewing is always PAUSED at start.
-    pub fn start(app: Arc<AppState>, out: mpsc::UnboundedSender<ServerMsg>) -> anyhow::Result<Self> {
+    pub fn start(
+        app: Arc<AppState>,
+        out: mpsc::UnboundedSender<Outbound>,
+        events: mpsc::UnboundedSender<SessionEvent>,
+    ) -> anyhow::Result<Self> {
         let memory = memory::load_memory(&app.config.data_dir)?;
         let conv = Conversation::new(
             claude::system_blocks(&claude::system_prompt(&app.config), &memory),
             claude::tools(&app.config),
         );
         let id = new_session_id();
+        let speaker = app.voice.tts.clone().map(|tts| Arc::new(Speaker::new(tts, out.clone())));
         let session = Self {
             id: id.clone(),
             shared: Arc::new(Mutex::new(Shared::default())),
             conv: Arc::new(tokio::sync::Mutex::new(conv)),
             out,
+            events,
             turn_cancel: None,
+            vad: Vad::new(app.config.voice.vad()),
+            mic_on: true,
+            speaker,
             app,
         };
         session.send(ServerMsg::SessionStarted {
             session_id: id,
             viewing: false,
             capture: session.app.config.capture.settings(),
+            voice: session.app.voice.caps(),
         });
         Ok(session)
     }
@@ -149,7 +201,7 @@ impl Session {
     }
 
     fn send(&self, msg: ServerMsg) {
-        let _ = self.out.send(msg);
+        let _ = self.out.send(Outbound::Msg(msg));
     }
 
     fn max_scan_segments(&self) -> usize {
@@ -300,8 +352,128 @@ impl Session {
         }
     }
 
-    /// Starts a turn for typed (or, later, transcribed) user text. Cancels any
-    /// turn in flight first.
+    // ------------------------------------------------------------ voice in
+
+    /// Mic audio from the browser (16 kHz PCM16).
+    pub fn handle_mic(&mut self, msg: &[u8]) {
+        if !self.mic_on || self.app.voice.stt.is_none() {
+            return;
+        }
+        let speaking = self.speaker.as_ref().is_some_and(|s| s.is_speaking());
+        self.vad.set_echo_guard(speaking);
+        for event in self.vad.feed(&decode_mic(msg)) {
+            self.vad_event(event);
+        }
+    }
+
+    pub fn mic_state(&mut self, on: bool) {
+        self.mic_on = on;
+        if !on {
+            self.vad.reset();
+            self.send(ServerMsg::Listen { state: ListenState::Idle });
+        }
+    }
+
+    pub fn ptt_down(&mut self) {
+        if self.app.voice.stt.is_some() {
+            if let Some(e) = self.vad.force_start() {
+                self.vad_event(e);
+            }
+        }
+    }
+
+    pub fn ptt_up(&mut self) {
+        if let Some(e) = self.vad.force_end() {
+            self.vad_event(e);
+        }
+    }
+
+    fn vad_event(&mut self, event: VadEvent) {
+        match event {
+            VadEvent::SpeechStart => {
+                // Barge-in: the user talking over the advisor stops it at once.
+                if self.speaker.as_ref().is_some_and(|s| s.is_speaking()) {
+                    tracing::info!("barge-in");
+                    self.interrupt();
+                }
+                self.send(ServerMsg::Listen { state: ListenState::Hearing });
+            }
+            VadEvent::Discarded => self.send(ServerMsg::Listen { state: ListenState::Idle }),
+            VadEvent::SpeechEnd(pcm) => {
+                let Some(stt) = self.app.voice.stt.clone() else { return };
+                self.send(ServerMsg::Listen { state: ListenState::Transcribing });
+                let events = self.events.clone();
+                let session_id = self.id.clone();
+                tokio::spawn(async move {
+                    let started = std::time::Instant::now();
+                    let secs = pcm.len() as f64 / protocol::MIC_SAMPLE_RATE as f64;
+                    let text = match tokio::task::spawn_blocking(move || stt.transcribe(&pcm)).await {
+                        Ok(Ok(t)) => t,
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "transcription failed");
+                            String::new()
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "transcription task failed");
+                            String::new()
+                        }
+                    };
+                    tracing::info!(audio_s = secs, took_ms = started.elapsed().as_millis() as u64, "transcribed");
+                    let _ = events.send(SessionEvent::Transcript { session_id, text });
+                });
+            }
+        }
+    }
+
+    /// A finished transcript. Scan commands are handled here and never reach
+    /// Claude; everything else becomes a user turn.
+    pub fn voice_text(&mut self, text: String) {
+        self.send(ServerMsg::Listen { state: ListenState::Idle });
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let scanning = self.shared.lock().unwrap().scan.is_active();
+        match spoken_command(&text) {
+            Some(command @ SpokenCommand::StartScan) => self.send(ServerMsg::CommandHeard { text, command }),
+            Some(command @ SpokenCommand::EndScan) if scanning => self.send(ServerMsg::CommandHeard { text, command }),
+            _ => self.user_text(text),
+        }
+    }
+
+    /// Stops the advisor: freezes what was heard, silences playback, and
+    /// cancels the turn in flight.
+    ///
+    /// If the reply had already finished streaming (so it's in the history in
+    /// full) but was still being spoken, the history can't be edited; a
+    /// system note tells the model how much the user actually heard.
+    pub fn interrupt(&mut self) {
+        if let Some(speaker) = &self.speaker {
+            let was_speaking = speaker.stop();
+            let mut s = self.shared.lock().unwrap();
+            if was_speaking && !s.turn_running {
+                let heard = speaker.heard_prefix().unwrap_or(0).min(s.last_reply.len());
+                let mut cut = heard;
+                while !s.last_reply.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                let heard_text = s.last_reply[..cut].trim().to_string();
+                let note = if heard_text.is_empty() {
+                    "The user interrupted before hearing any of your last reply.".to_string()
+                } else {
+                    format!(
+                        "The user interrupted you. They heard only this much of your last reply: \"{heard_text}\". \
+                         They did not hear the rest."
+                    )
+                };
+                s.pending_notes.push(note);
+            }
+        }
+        self.cancel_turn();
+    }
+
+    /// Starts a turn for typed or transcribed user text. Interrupts any turn
+    /// in flight first.
     pub fn user_text(&mut self, text: String) {
         let text = text.trim().to_string();
         if text.is_empty() {
@@ -310,20 +482,23 @@ impl Session {
         if is_pause_command(&text) {
             self.pause_from_server();
         }
-        self.cancel_turn();
+        self.interrupt();
         self.send(ServerMsg::UserTurn { text: text.clone() });
 
         let cancel = CancellationToken::new();
         self.turn_cancel = Some(cancel.clone());
         let app = self.app.clone();
         let conv = self.conv.clone();
-        let host = SessionHost { shared: self.shared.clone(), out: self.out.clone() };
+        let speaker = self.speaker.clone();
+        let host = SessionHost { shared: self.shared.clone(), out: self.out.clone(), speaker: speaker.clone() };
         let out = self.out.clone();
+        let shared = self.shared.clone();
         tokio::spawn(async move {
             let mut conv = conv.lock().await;
             if cancel.is_cancelled() {
                 return;
             }
+            shared.lock().unwrap().turn_running = true;
             claude::close_dangling_tool_uses(&mut conv);
             for note in host.take_notes() {
                 conv.note(note);
@@ -332,30 +507,50 @@ impl Session {
 
             let (tx, mut rx) = mpsc::unbounded_channel();
             let fwd_out = out.clone();
+            let speech = speaker.as_ref().map(|s| s.begin());
             let forward = tokio::spawn(async move {
+                let mut chunker = SentenceChunker::new();
                 while let Some(ev) = rx.recv().await {
                     let msg = match ev {
-                        TurnEvent::Text(text) => ServerMsg::AssistantDelta { text },
+                        TurnEvent::Text(text) => {
+                            if let Some(h) = &speech {
+                                for (sentence, end) in chunker.push(&text) {
+                                    h.say(sentence, end);
+                                }
+                            }
+                            ServerMsg::AssistantDelta { text }
+                        }
                         TurnEvent::Tool { name, detail } => ServerMsg::ToolActivity { tool: name, detail },
                     };
-                    let _ = fwd_out.send(msg);
+                    let _ = fwd_out.send(Outbound::Msg(msg));
+                }
+                if let (Some(h), Some((sentence, end))) = (&speech, chunker.finish()) {
+                    h.say(sentence, end);
                 }
             });
             let effort = app.claude.config().effort.clone();
             let result = run_turn(&app.claude, &mut conv, &host, &effort, &cancel, &tx).await;
             drop(tx);
             let _ = forward.await;
+            {
+                let mut s = shared.lock().unwrap();
+                s.turn_running = false;
+                s.last_reply = match &result {
+                    Ok(outcome) => outcome.text.clone(),
+                    Err(_) => String::new(),
+                };
+            }
             let stop_reason = match result {
                 Ok(outcome) => outcome.stop_reason,
                 Err(ClaudeError::Cancelled) => "cancelled".into(),
                 Err(e) => {
                     tracing::error!(error = %e, "turn failed");
                     claude::close_dangling_tool_uses(&mut conv);
-                    let _ = out.send(ServerMsg::Error { message: e.to_string() });
+                    let _ = out.send(Outbound::Msg(ServerMsg::Error { message: e.to_string() }));
                     "error".into()
                 }
             };
-            let _ = out.send(ServerMsg::AssistantDone { stop_reason });
+            let _ = out.send(Outbound::Msg(ServerMsg::AssistantDone { stop_reason }));
         });
     }
 
@@ -365,9 +560,11 @@ impl Session {
         }
     }
 
-    /// Hang up: stop the turn, pause, and wipe the frame buffers and notes.
+    /// Hang up: stop the turn and speech, pause, and wipe the frame buffers,
+    /// notes, and any partial utterance.
     pub fn end(&mut self) {
-        self.cancel_turn();
+        self.interrupt();
+        self.vad.reset();
         let mut s = self.shared.lock().unwrap();
         s.viewing = false;
         s.frames.wipe();
@@ -380,7 +577,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        self.cancel_turn();
+        self.interrupt();
         if let Ok(mut s) = self.shared.lock() {
             s.viewing = false;
             s.frames.wipe();
@@ -392,10 +589,15 @@ impl Drop for Session {
 
 struct SessionHost {
     shared: Arc<Mutex<Shared>>,
-    out: mpsc::UnboundedSender<ServerMsg>,
+    out: mpsc::UnboundedSender<Outbound>,
+    speaker: Option<Arc<Speaker>>,
 }
 
 impl ToolHost for SessionHost {
+    fn heard_prefix(&self) -> Option<usize> {
+        self.speaker.as_ref().and_then(|s| s.heard_prefix())
+    }
+
     fn take_notes(&self) -> Vec<String> {
         std::mem::take(&mut self.shared.lock().unwrap().pending_notes)
     }
@@ -420,12 +622,12 @@ impl ToolHost for SessionHost {
                 } else {
                     format!("recorded note: {}", note.page)
                 };
-                let _ = self.out.send(ServerMsg::ScreenNote {
+                let _ = self.out.send(Outbound::Msg(ServerMsg::ScreenNote {
                     id: note.id,
                     page: note.page,
                     notes: note.notes,
                     revision: note.revision,
-                });
+                }));
                 ToolOutput { content: vec![ContentBlock::text("Noted.")], is_error: false, detail }
             }
             Err(e) => {

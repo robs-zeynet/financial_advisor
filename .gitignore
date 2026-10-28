@@ -4,3 +4,5 @@
 /dist/
 config.toml
 .claude_api_key
+# Local voice models and binaries (scripts/fetch-models.sh). Large; never commit.
+/models/

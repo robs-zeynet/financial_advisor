@@ -10,7 +10,7 @@ use common::*;
 use protocol::{ClientMsg, FrameHeader, ServerMsg};
 use serde_json::{json, Value};
 use server::claude::{ClaudeClient, PAUSED_TEXT};
-use server::session::{AppState, Session};
+use server::session::{AppState, Session, Voice};
 
 const SEG: [&[u8]; 4] = [
     b"\xFF\xD8\xFF\xE0segment-0",
@@ -253,9 +253,10 @@ async fn saying_pause_viewing_cancels_a_scan_and_drops_in_flight_segments() {
 async fn hang_up_wipes_both_buffers() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path(), "http://127.0.0.1:9");
-    let app = Arc::new(AppState { claude: ClaudeClient::new(config.claude.clone(), None), config });
+    let app = Arc::new(AppState { claude: ClaudeClient::new(config.claude.clone(), None), config, voice: Voice::default() });
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut s = Session::start(app, tx).unwrap();
+    let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut s = Session::start(app, tx, events).unwrap();
     s.start_scan(1);
     let seg = FrameHeader { scan_id: 1, ..FrameHeader::live(1, 800, 600, true) };
     s.handle_frame(&seg.encode(SEG[0]));

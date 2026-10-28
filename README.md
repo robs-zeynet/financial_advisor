@@ -4,18 +4,20 @@ A local-first, single-user web app: you "call" a Claude-powered financial
 analyst from your browser and, when you choose, let it see one shared window or
 tab. See `PROMPT.md` for the full spec and privacy invariants.
 
-**Status: M2 (screen notes).** Typed chat with Claude, `view_screen` with the
-capture loop, pause/resume (P2), page scans for pages longer than one screen,
-and screen notes: the advisor writes down what it read off your screen, you
-see every note live, and notes are linted for identifiers and last only for
-the call. Next: voice (M3), records (M4), memory approval (M5), and polish
-plus the full privacy write-up (M6).
+**Status: M3 (voice).** Talk to the advisor and it answers out loud; talk
+over it to interrupt. Plus typed chat, `view_screen` with pause/resume (P2),
+page scans for long pages, and linted, session-only screen notes. Next:
+records (M4), memory approval (M5), and polish plus the full privacy write-up
+(M6).
 
 ## Run
+
+Building needs cmake, a C++ compiler, and libclang (for whisper.cpp).
 
 ```sh
 cargo install trunk wasm-pack          # once
 rustup target add wasm32-unknown-unknown
+scripts/fetch-models.sh                # once: ~580 MB of local voice models into models/
 trunk build --release                  # builds the WASM client into dist/
 cargo build --release -p server        # embeds dist/ into the binary
 export ANTHROPIC_API_KEY=...
@@ -48,6 +50,23 @@ fees) once the screenshots leave its context. Each note appears in the
 account or card number, SSN, routing number, email, street address, or
 credential is rejected and the advisor rewrites it. Notes are held in memory
 only and are discarded when you hang up.
+
+### Voice
+
+Speech never leaves the machine: Whisper (`small.en`) transcribes locally and
+Piper speaks locally; audio lives only in memory and is never stored.
+
+- **Hands-free:** just talk. About 0.7 s of silence ends your turn.
+- **Interrupt:** talk over the advisor and it stops at once. Only what you
+  actually heard is kept as its reply.
+- **Push-to-talk:** hold Space (outside the text box).
+- **Spoken commands** handled locally, never sent to Claude: "scan this page",
+  "done" (during a scan), and "pause viewing".
+- **Mic on/off** button; the level meter shows what the mic hears.
+
+Use headphones or the browser's echo cancellation (on by default) so the
+advisor's voice doesn't count as you interrupting. If the models are missing,
+voice turns off and typing still works.
 
 ## Test
 

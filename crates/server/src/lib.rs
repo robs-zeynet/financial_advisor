@@ -5,4 +5,7 @@ pub mod memory;
 pub mod redact;
 pub mod screen_notes;
 pub mod session;
+pub mod stt;
+pub mod tts;
+pub mod vad;
 pub mod web;

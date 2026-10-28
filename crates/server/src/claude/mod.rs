@@ -414,6 +414,13 @@ pub trait ToolHost: Sync {
         Vec::new()
     }
 
+    /// When replies are spoken: byte length of this turn's text the user has
+    /// heard. On barge-in only that much is recorded as the assistant turn.
+    /// `None` when nothing is spoken (the whole streamed text counts).
+    fn heard_prefix(&self) -> Option<usize> {
+        None
+    }
+
     /// `input` is the tool call's validated input (`reason`, optional `scope`).
     fn view_screen(&self, input: &Value) -> impl Future<Output = ToolOutput> + Send;
 
@@ -466,10 +473,17 @@ pub async fn run_turn(
         let acc = match result {
             Ok(acc) => acc,
             Err(ClaudeError::Cancelled) => {
-                // Record only what was already said; drop partial thinking and tool calls.
+                // Record only what the user heard (or, without speech, what was
+                // shown); drop partial thinking and tool calls.
+                let round_start = spoken.len();
                 spoken.push_str(&round_text);
-                if !round_text.is_empty() {
-                    conv.push_assistant(vec![ContentBlock::text(round_text)]);
+                let mut cut = host.heard_prefix().unwrap_or(spoken.len()).clamp(round_start, spoken.len());
+                while !spoken.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                let heard = spoken[round_start..cut].trim();
+                if !heard.is_empty() {
+                    conv.push_assistant(vec![ContentBlock::text(heard)]);
                 }
                 return Err(ClaudeError::Cancelled);
             }

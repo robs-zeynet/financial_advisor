@@ -112,3 +112,14 @@ textarea {
 @media (max-width: 760px) {
   .panes { grid-template-columns: 1fr; grid-template-rows: minmax(200px, 2fr) minmax(120px, 1fr); }
 }
+.voice-row { display: flex; align-items: center; gap: 10px; min-height: 1.5em; }
+.meter {
+  width: 120px;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--border);
+  overflow: hidden;
+}
+.meter-fill { height: 100%; width: 0%; background: var(--accent); transition: width 60ms linear; }
+.voice-status { color: var(--muted); font-size: 0.9rem; }
+button.muted { color: var(--danger); border-color: var(--danger); }
