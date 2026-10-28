@@ -1,7 +1,9 @@
 //! The call screen: start/end, viewing toggle and page scans with the big
-//! state indicator, the live transcript, and typed input.
+//! state indicator, the live transcript, the screen notes pane, and typed
+//! input.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use protocol::{
@@ -35,6 +37,10 @@ pub struct CallView {
     view_btn: Element,
     scan_btn: Element,
     transcript: Element,
+    notes_list: Element,
+    notes_count: Element,
+    /// Note elements by note id, so updates replace in place.
+    note_els: RefCell<HashMap<u32, Element>>,
     input: HtmlTextAreaElement,
     send_btn: Element,
     status: Element,
@@ -81,7 +87,18 @@ impl CallView {
             ),
         );
 
+        let panes = el("div", "panes");
         let transcript = el("div", "transcript");
+        let notes_pane = el("aside", "notes");
+        let notes_head = el("h2", "");
+        append(&notes_head, &el_text("span", "", "Screen notes "));
+        let notes_count = el_text("span", "count", "");
+        append(&notes_head, &notes_count);
+        let notes_list = el("div", "notes-list");
+        append(&notes_pane, &notes_head);
+        append(&notes_pane, &notes_list);
+        append(&panes, &transcript);
+        append(&panes, &notes_pane);
         let input_row = el("div", "input-row");
         let input: HtmlTextAreaElement = el("textarea", "").unchecked_into();
         input.set_placeholder("Ask the advisor… (Enter to send, Shift+Enter for a new line)");
@@ -91,7 +108,7 @@ impl CallView {
         append(&input_row, &send_btn);
         let status = el("div", "status");
 
-        for e in [&header, &controls, &hint, &transcript, &input_row, &status] {
+        for e in [&header, &controls, &hint, &panes, &input_row, &status] {
             append(root, e);
         }
 
@@ -109,11 +126,15 @@ impl CallView {
             view_btn,
             scan_btn,
             transcript,
+            notes_list,
+            notes_count,
+            note_els: RefCell::new(HashMap::new()),
             input,
             send_btn,
             status,
             current: RefCell::new(None),
         });
+        view.clear_notes();
         view.connect();
         view.wire();
         view.render();
@@ -383,6 +404,7 @@ impl CallView {
                 }
                 self.in_call.set(true);
                 self.transcript.set_inner_html("");
+                self.clear_notes();
                 self.set_status("Call started. Viewing is paused.", false);
             }
             ServerMsg::SessionEnded { .. } => {
@@ -419,6 +441,7 @@ impl CallView {
                 }
                 self.close_current();
             }
+            ServerMsg::ScreenNote { id, page, notes, revision } => self.show_note(id, &page, &notes, revision),
             ServerMsg::ToolActivity { tool, detail } => {
                 let line = el_text("div", "tool", &format!("[{tool}: {detail}]"));
                 append(&self.transcript, &line);
@@ -430,6 +453,45 @@ impl CallView {
             ServerMsg::Error { message } => self.set_status(&message, true),
         }
         self.render();
+    }
+
+    /// Empties the notes pane (new call). Notes last only for one call.
+    fn clear_notes(&self) {
+        self.note_els.borrow_mut().clear();
+        self.notes_list.set_inner_html("");
+        append(
+            &self.notes_list,
+            &el_text(
+                "p",
+                "notes-empty",
+                "What the advisor writes down from your screen appears here. Notes last only for this call.",
+            ),
+        );
+        set_text(&self.notes_count, "");
+    }
+
+    /// Adds a note, or replaces the note with the same id.
+    fn show_note(&self, id: u32, page: &str, notes: &str, revision: u32) {
+        let card = el("div", "note");
+        let title = el("h3", "");
+        append(&title, &el_text("span", "", page));
+        if revision > 1 {
+            append(&title, &el_text("span", "badge", &format!("updated ×{}", revision - 1)));
+        }
+        append(&card, &title);
+        append(&card, &el_text("div", "note-body", notes));
+        let mut els = self.note_els.borrow_mut();
+        if els.is_empty() {
+            self.notes_list.set_inner_html("");
+        }
+        match els.get(&id) {
+            Some(old) => {
+                let _ = old.replace_with_with_node_1(&card);
+            }
+            None => append(&self.notes_list, &card),
+        }
+        els.insert(id, card);
+        set_text(&self.notes_count, &format!("({})", els.len()));
     }
 
     fn close_current(&self) {

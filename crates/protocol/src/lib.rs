@@ -115,6 +115,14 @@ pub enum ServerMsg {
     AssistantDone {
         stop_reason: String,
     },
+    /// The advisor recorded or updated a screen note (P9). A note with an
+    /// `id` already shown replaces it.
+    ScreenNote {
+        id: u32,
+        page: String,
+        notes: String,
+        revision: u32,
+    },
     /// The advisor is looking at the screen.
     ToolActivity {
         tool: String,

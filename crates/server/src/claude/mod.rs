@@ -29,6 +29,7 @@ holdings sizes, or anything you saw on the user's screen. Search for general \
 topics only (for example \"VTSAX expense ratio\", not the user's position).";
 
 pub const VIEW_SCREEN: &str = "view_screen";
+pub const RECORD_SCREEN_NOTES: &str = "record_screen_notes";
 pub const PAUSED_TEXT: &str = "Viewing is paused by the user.";
 pub const REFUSAL_APOLOGY: &str = "Sorry, I can't help with that one. Could we try it a different way?";
 
@@ -82,10 +83,38 @@ what is on their screen.",
     })
 }
 
-/// The complete tool list. `view_screen` is the only client tool; web search
-/// is added only when explicitly enabled.
+pub fn record_screen_notes_tool() -> Value {
+    json!({
+        "name": RECORD_SCREEN_NOTES,
+        "description": "Write down facts you read off the user's screen so you still have them after \
+the screenshots leave your context: holdings with approximate values and weights, expense ratios, \
+cash, balances, rates, and which part of the page you saw. One note per page; calling again with \
+the same page label replaces that page's note. Notes are plain text, shown to the user, kept only \
+for this call, and rejected if they contain full account or card numbers, SSNs, routing numbers, \
+emails, street addresses, or credentials.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "page": {
+                    "type": "string",
+                    "description": "Short label for the page, e.g. \"Fidelity brokerage ...1234 positions\"."
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "The facts, as plain text."
+                }
+            },
+            "required": ["page", "notes"],
+            "additionalProperties": false
+        },
+        "strict": true
+    })
+}
+
+/// The complete tool list: exactly `view_screen` and `record_screen_notes`,
+/// plus web search only when explicitly enabled.
 pub fn tools(cfg: &Config) -> Vec<Value> {
-    let mut tools = vec![view_screen_tool()];
+    let mut tools = vec![view_screen_tool(), record_screen_notes_tool()];
     if cfg.web_search.enabled {
         tools.push(json!({
             "type": "web_search_20260209",
@@ -97,6 +126,7 @@ pub fn tools(cfg: &Config) -> Vec<Value> {
 }
 
 /// Server-side context editing: keep only the most recent screen views.
+/// Screen notes are never cleared.
 pub fn context_management(cfg: &ClaudeConfig) -> Value {
     json!({
         "edits": [{
@@ -104,7 +134,7 @@ pub fn context_management(cfg: &ClaudeConfig) -> Value {
             "trigger": {"type": "input_tokens", "value": cfg.clear_trigger_tokens},
             "keep": {"type": "tool_uses", "value": cfg.keep_screen_views},
             "clear_at_least": {"type": "input_tokens", "value": cfg.clear_at_least_tokens},
-            "exclude_tools": ["web_search"]
+            "exclude_tools": [RECORD_SCREEN_NOTES, "web_search"]
         }]
     })
 }
@@ -386,6 +416,9 @@ pub trait ToolHost: Sync {
 
     /// `input` is the tool call's validated input (`reason`, optional `scope`).
     fn view_screen(&self, input: &Value) -> impl Future<Output = ToolOutput> + Send;
+
+    /// `input` is the tool call's validated input (`page`, `notes`).
+    fn record_screen_notes(&self, input: &Value) -> ToolOutput;
 }
 
 /// Progress of a turn, for the UI.
@@ -423,7 +456,7 @@ pub async fn run_turn(
                         round_text.push_str(&t);
                         let _ = events.send(TurnEvent::Text(t));
                     }
-                    Update::ToolUseStart { name } if name != VIEW_SCREEN => {
+                    Update::ToolUseStart { name } if name != VIEW_SCREEN && name != RECORD_SCREEN_NOTES => {
                         let _ = events.send(TurnEvent::Tool { name, detail: String::new() });
                     }
                     _ => {}
@@ -475,6 +508,8 @@ pub async fn run_turn(
                 for (id, name, input) in tool_calls {
                     let out = if name == VIEW_SCREEN {
                         host.view_screen(&input).await
+                    } else if name == RECORD_SCREEN_NOTES {
+                        host.record_screen_notes(&input)
                     } else {
                         ToolOutput {
                             content: vec![ContentBlock::text(format!("Unknown tool: {name}"))],

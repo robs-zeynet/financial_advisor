@@ -85,3 +85,30 @@ textarea {
 .status { min-height: 1.5em; color: var(--muted); font-size: 0.9rem; }
 .status.error { color: var(--danger); }
 .hidden-capture { display: none; }
+.panes {
+  flex: 1;
+  min-height: 200px;
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 12px;
+}
+.panes .transcript { min-height: 0; }
+.notes {
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+}
+.notes h2 { font-size: 1rem; margin: 0 0 8px; }
+.notes h2 .count { color: var(--muted); font-weight: normal; }
+.notes-empty { color: var(--muted); font-size: 0.9rem; margin: 0; }
+.note { border-top: 1px solid var(--border); padding: 8px 0; }
+.note:first-child { border-top: none; padding-top: 0; }
+.note h3 { font-size: 0.9rem; margin: 0 0 4px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.note .badge { font-size: 0.75rem; font-weight: normal; color: var(--muted); }
+.note-body { white-space: pre-wrap; font-size: 0.9rem; }
+@media (max-width: 760px) {
+  .panes { grid-template-columns: 1fr; grid-template-rows: minmax(200px, 2fr) minmax(120px, 1fr); }
+}

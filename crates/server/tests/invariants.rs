@@ -47,18 +47,20 @@ fn no_input_or_browser_automation_dependencies() {
 }
 
 #[test]
-fn tool_list_is_only_view_screen() {
+fn tool_list_is_view_screen_and_notes_only() {
     let mut cfg = server::config::Config::default();
     let names = |cfg: &server::config::Config| -> Vec<String> {
         server::claude::tools(cfg).iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
     };
-    assert_eq!(names(&cfg), vec!["view_screen"]);
+    assert_eq!(names(&cfg), vec!["view_screen", "record_screen_notes"]);
     cfg.web_search.enabled = true;
-    assert_eq!(names(&cfg), vec!["view_screen", "web_search"]);
-    // The only client-executed tool is view_screen; web search is server-side.
+    assert_eq!(names(&cfg), vec!["view_screen", "record_screen_notes", "web_search"]);
+    // The client-executed tools are view_screen and record_screen_notes, both
+    // strict; web search is server-side.
     let tools = server::claude::tools(&cfg);
-    assert_eq!(tools[1]["type"], "web_search_20260209");
-    assert!(tools[1]["max_uses"].as_u64().unwrap() <= 5);
+    assert!(tools[..2].iter().all(|t| t["strict"] == true));
+    assert_eq!(tools[2]["type"], "web_search_20260209");
+    assert!(tools[2]["max_uses"].as_u64().unwrap() <= 5);
 }
 
 // ------------------------------------------------------------ test 3
@@ -221,4 +223,27 @@ fn only_hand_written_js_is_the_audio_worklet() {
         let lines = std::fs::read_to_string(worklet).unwrap().lines().count();
         assert!(lines <= 40, "web/audio-worklet.js must stay under ~40 lines (has {lines})");
     }
+}
+
+// ------------------------------------------------------------ prompts
+
+/// The fenced block under a PROMPT.md heading, as the prompt files store it.
+fn appendix_block(heading: &str, fence: &str) -> String {
+    let spec = std::fs::read_to_string(repo_root().join("PROMPT.md")).unwrap();
+    let section = spec.split(heading).nth(1).expect("appendix heading");
+    let body = section.split(fence).nth(1).expect("opening fence");
+    let block = body.split("\n```").next().expect("closing fence");
+    format!("{}\n", block.trim_start_matches('\n').trim_end_matches('\n'))
+}
+
+#[test]
+fn advisor_prompt_is_appendix_a_verbatim() {
+    let expected = appendix_block("## Appendix A", "```\n");
+    assert_eq!(server::claude::ADVISOR_SYSTEM_PROMPT, expected, "prompts/advisor_system.md must match Appendix A");
+}
+
+#[test]
+fn summary_template_contains_appendix_b() {
+    let template = appendix_block("## Appendix B", "```markdown\n");
+    assert!(server::claude::SUMMARY_TEMPLATE.contains(template.trim_end()), "summary_template.md must contain Appendix B");
 }

@@ -21,6 +21,7 @@ use crate::claude::{
 use crate::config::Config;
 use crate::frames::{FrameRing, ScanBuffer, ScanReject};
 use crate::memory;
+use crate::screen_notes::ScreenNotes;
 
 pub struct AppState {
     pub config: Config,
@@ -38,6 +39,8 @@ pub struct Shared {
     pub awaiting_pause_ack: bool,
     pub frames: FrameRing,
     pub scan: ScanBuffer,
+    /// This session's screen notes (P9). RAM only.
+    pub notes: ScreenNotes,
     pub violations: u64,
     /// Viewing-state notes for the model, appended after the next user message.
     pub pending_notes: Vec<String>,
@@ -133,6 +136,11 @@ impl Session {
 
     pub fn scan_segment_count(&self) -> usize {
         self.shared.lock().unwrap().scan.len()
+    }
+
+    /// Current screen notes as (page, notes) pairs.
+    pub fn screen_notes(&self) -> Vec<(String, String)> {
+        self.shared.lock().unwrap().notes.current().iter().map(|n| (n.page.clone(), n.notes.clone())).collect()
     }
 
     /// A snapshot of the conversation (for tests and records).
@@ -309,7 +317,7 @@ impl Session {
         self.turn_cancel = Some(cancel.clone());
         let app = self.app.clone();
         let conv = self.conv.clone();
-        let host = SessionHost { shared: self.shared.clone() };
+        let host = SessionHost { shared: self.shared.clone(), out: self.out.clone() };
         let out = self.out.clone();
         tokio::spawn(async move {
             let mut conv = conv.lock().await;
@@ -357,13 +365,14 @@ impl Session {
         }
     }
 
-    /// Hang up: stop the turn, pause, and wipe both buffers.
+    /// Hang up: stop the turn, pause, and wipe the frame buffers and notes.
     pub fn end(&mut self) {
         self.cancel_turn();
         let mut s = self.shared.lock().unwrap();
         s.viewing = false;
         s.frames.wipe();
         s.scan.wipe();
+        s.notes.wipe();
         drop(s);
         self.send(ServerMsg::SessionEnded { session_id: self.id.clone() });
     }
@@ -376,12 +385,14 @@ impl Drop for Session {
             s.viewing = false;
             s.frames.wipe();
             s.scan.wipe();
+            s.notes.wipe();
         }
     }
 }
 
 struct SessionHost {
     shared: Arc<Mutex<Shared>>,
+    out: mpsc::UnboundedSender<ServerMsg>,
 }
 
 impl ToolHost for SessionHost {
@@ -395,6 +406,37 @@ impl ToolHost for SessionHost {
         tracing::info!(%reason, %scope, "view_screen");
         let out = if scope == "scan" { self.look_at_scan() } else { self.look_current() };
         async move { out }
+    }
+
+    fn record_screen_notes(&self, input: &Value) -> ToolOutput {
+        let page = input.get("page").and_then(Value::as_str).unwrap_or("");
+        let notes = input.get("notes").and_then(Value::as_str).unwrap_or("");
+        let result = self.shared.lock().unwrap().notes.record(page, notes);
+        match result {
+            Ok(note) => {
+                tracing::info!(id = note.id, revision = note.revision, chars = note.notes.len(), "screen note recorded");
+                let detail = if note.revision > 1 {
+                    format!("updated note: {}", note.page)
+                } else {
+                    format!("recorded note: {}", note.page)
+                };
+                let _ = self.out.send(ServerMsg::ScreenNote {
+                    id: note.id,
+                    page: note.page,
+                    notes: note.notes,
+                    revision: note.revision,
+                });
+                ToolOutput { content: vec![ContentBlock::text("Noted.")], is_error: false, detail }
+            }
+            Err(e) => {
+                tracing::info!(reason = e.reason(), "screen note rejected");
+                ToolOutput {
+                    content: vec![ContentBlock::text(e.message())],
+                    is_error: true,
+                    detail: format!("note rejected ({}); the advisor will rewrite it", e.reason()),
+                }
+            }
+        }
     }
 }
 

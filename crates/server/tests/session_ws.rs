@@ -105,9 +105,9 @@ async fn view_screen_returns_frames_and_request_shape_is_locked_down() {
     assert!(betas.contains("server-side-fallback-2026-07-01"));
     assert!(betas.contains("context-management-2025-06-27"));
 
-    // Tools: view_screen only (test 1).
+    // Tools: view_screen and record_screen_notes only (test 1).
     let names: Vec<&str> = first["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, vec!["view_screen"]);
+    assert_eq!(names, vec!["view_screen", "record_screen_notes"]);
 
     // System = frozen prompt + load_memory(), byte for byte, cache breakpoint after memory (test 4).
     let memory = load_memory(dir.path()).unwrap();
